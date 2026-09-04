@@ -1,0 +1,17 @@
+# Development happens on Windows but the containers and any CI run Linux.
+# Normalising to LF in the repository keeps shell scripts, YAML and Docker
+# healthchecks working regardless of where the clone happens.
+* text=auto eol=lf
+
+# Files that must be LF or they break when executed inside a container.
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Never let Git rewrite bytes inside scraped documents or test fixtures -
+# a single line-ending change would alter their SHA-256 and silently break
+# the hash-based deduplication tests.
+*.pdf  binary
+*.doc  binary
+*.docx binary
+tests/fixtures/** -text

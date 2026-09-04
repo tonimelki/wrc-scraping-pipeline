@@ -1,0 +1,80 @@
+# Landing Zone infrastructure for the WRC scraping pipeline.
+#
+# Two services, both required by the exercise brief ("Use a NoSQL DB and an
+# object storage in docker containers"):
+#   mongo  - metadata store (landing + curated collections)
+#   minio  - S3-compatible object storage (landing + curated buckets)
+#
+# Every value a reviewer might need to change is an environment variable with a
+# sensible local default, so `docker compose up -d` works from a clean clone
+# with no .env file, while `.env` still overrides everything for other
+# environments. See .env.example.
+#
+# Note: no top-level `version:` key. It has been obsolete since Compose v2 and
+# emits a warning if present.
+
+name: wrc-pipeline
+
+services:
+  mongo:
+    # Pinned to an exact patch release rather than a floating tag so that a
+    # reviewer running this months from now gets byte-identical behaviour.
+    # Bumping it is a deliberate, reviewable one-line change.
+    image: ${MONGO_IMAGE:-mongo:8.0.29}
+    container_name: wrc-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-wrc}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-wrc_local_dev_pw}
+    ports:
+      # Host port is configurable because 27017 is often already taken by a
+      # locally installed MongoDB; the container port never changes.
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      # NAMED volume, not an anonymous one and not a bind mount. Without a
+      # named volume the database is discarded on `docker compose down` and
+      # idempotency (run twice, get one record) becomes impossible to
+      # demonstrate. A bind mount would work too but performs poorly for
+      # database files on Docker Desktop for Windows.
+      - mongo_data:/data/db
+    healthcheck:
+      # `depends_on: condition: service_healthy` is only meaningful if the
+      # healthcheck actually probes the database rather than the process.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  minio:
+    # Pinned deliberately to the April 2025 release: later community releases
+    # strip the object browser out of the web console, and being able to click
+    # through the buckets is genuinely useful when demonstrating the landing
+    # vs. curated split. The S3 API itself is unchanged either way.
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    container_name: wrc-minio
+    restart: unless-stopped
+    # `server /data` serves the S3 API on :9000; the console is a separate
+    # port so both can be published independently.
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-wrcadmin}
+      # MinIO refuses to start if this is shorter than 8 characters.
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-wrc_local_dev_pw}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"           # S3 API
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      # MinIO's own liveness endpoint. `mc` ships inside the image, so this
+      # needs no extra tooling.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  mongo_data:
+  minio_data:

@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wrc-pipeline"
+version = "0.1.0"
+description = "Scrapy pipeline for Ireland's Workplace Relations Commission decisions database"
+readme = "README.md"
+
+# Upper bound is deliberate, not lazy. Scrapy's supported Python matrix
+# currently tops out at 3.13; Twisted on 3.14 is not yet a combination Scrapy
+# tests against, and a scraper that fails intermittently inside the async
+# reactor is the worst class of bug to debug. The project therefore targets
+# 3.13. Raise the ceiling once Scrapy ships 3.14 support.
+requires-python = ">=3.11,<3.14"
+
+dependencies = [
+    # Scraping - mandated by the exercise.
+    "scrapy>=2.12",
+    # lxml is Scrapy's parser backend and BeautifulSoup's fastest one. Pinning
+    # it explicitly means the transform step and the spider parse HTML with the
+    # same engine, so "it worked in the spider" implies "it works in the
+    # transform".
+    "lxml>=5.2",
+
+    # Storage.
+    "pymongo>=4.8",
+    # boto3 rather than the `minio` SDK: MinIO speaks the S3 API, so writing
+    # against boto3 means moving to real AWS S3 later is a config change
+    # (endpoint URL) instead of a code change. Directly relevant to the
+    # "what would you change for 50+ sources" question in ARCHITECTURE.md.
+    "boto3>=1.35",
+
+    # Transformation - BeautifulSoup is named explicitly in the exercise.
+    "beautifulsoup4>=4.12",
+
+    # Configuration. settings.yaml carries behaviour, .env carries secrets.
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Kept out of the base install so `pip install -e .` stays fast and the core
+# pipeline provably does not import anything orchestration-specific.
+orchestration = [
+    "dagster>=1.8",
+    "dagster-webserver>=1.8",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Lets a reviewer run a bare `dagster dev` from the repository root, rather
+# than having to know the module path.
+[tool.dagster]
+module_name = "wrc_pipeline.orchestration.definitions"
+code_location_name = "wrc_pipeline"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Surface warnings during development rather than letting a deprecation slide
+# until it becomes a breakage.
+filterwarnings = ["default"]
+markers = [
+    "integration: exercises the real MongoDB and MinIO containers; skipped automatically when they are not running (see tests/conftest.py)",
+]

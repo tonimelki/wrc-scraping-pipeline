@@ -1,0 +1,42 @@
+# --- Secrets ----------------------------------------------------------------
+# .env.example is committed; .env is not.
+.env
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# --- Tooling ----------------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Scrapy -----------------------------------------------------------------
+# Scrapy's on-disk HTTP cache and job state. Useful locally, never committed.
+.scrapy/
+
+# --- Dagster ----------------------------------------------------------------
+# Local run storage / event log created by `dagster dev`.
+.dagster_home/
+dagster_home/
+tmp*/
+
+# --- Local scratch ----------------------------------------------------------
+# Anything downloaded outside the object store while debugging.
+data/
+logs/
+*.log
+
+# --- Editors / OS -----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
