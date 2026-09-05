@@ -44,8 +44,10 @@ def bucket(live_settings):
     store = ObjectStore.from_settings(live_settings)
     store.ensure_bucket(name)
     yield store, name
-    for key in list(store.list_keys(name)):
-        store.delete_object(name, key)
+    # Delete the bucket, not just its contents: emptying it leaves the bucket
+    # behind, so every run of the suite would add one to the MinIO volume
+    # permanently.
+    store.delete_bucket(name)
 
 
 def make_document(**overrides) -> dict:
@@ -292,6 +294,34 @@ def test_reading_a_missing_object_raises(bucket):
 def test_ensure_bucket_is_idempotent(bucket):
     store, name = bucket
     assert store.ensure_bucket(name) is False  # already created by the fixture
+
+
+def test_delete_bucket_removes_a_bucket_that_still_has_objects(bucket):
+    """S3 refuses to delete a non-empty bucket, so this has to empty it first.
+
+    Without that, a test failing part-way through would leave objects behind
+    and the teardown would raise while cleaning up - turning one red test into
+    a red test plus an error, and still leaking the bucket.
+    """
+    store, _ = bucket
+    name = f"wrc-test-{uuid.uuid4().hex[:8]}"
+    store.ensure_bucket(name)
+    store.put_object(name, "a.txt", b"content")
+
+    assert store.delete_bucket(name) is True
+    # False means head_bucket 404'd, so the bucket is genuinely gone rather
+    # than merely emptied.
+    assert store.delete_bucket(name) is False
+
+
+def test_delete_bucket_is_idempotent(bucket):
+    """A teardown may run twice, or after a test already cleaned up."""
+    store, _ = bucket
+    name = f"wrc-test-{uuid.uuid4().hex[:8]}"
+    store.ensure_bucket(name)
+
+    assert store.delete_bucket(name) is True
+    assert store.delete_bucket(name) is False
 
 
 def test_list_keys_pages_past_the_1000_key_limit(bucket):

@@ -54,12 +54,14 @@ def zone(live_settings):
     with MetadataStore.from_settings(settings) as store:
         store.drop_collection(settings.mongo.landing_collection)
         store.drop_collection(settings.mongo.curated_collection)
+    # Delete the buckets, not just their contents: emptying one leaves the
+    # bucket behind, so every run of the suite would add two to the MinIO
+    # volume permanently.
     for bucket in (
         settings.object_store.landing_bucket,
         settings.object_store.curated_bucket,
     ):
-        for key in list(objects.list_keys(bucket)):
-            objects.delete_object(bucket, key)
+        objects.delete_bucket(bucket)
 
 
 def seed(settings, objects, *, identifier, url, payload, extension=".html"):

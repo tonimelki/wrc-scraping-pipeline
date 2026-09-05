@@ -114,6 +114,42 @@ class ObjectStore:
         except BotoCoreError as exc:
             raise ObjectStoreError(f"could not reach object storage: {exc}") from exc
 
+    def delete_bucket(self, bucket: str) -> bool:
+        """Delete ``bucket`` and everything in it. Returns True if it existed.
+
+        Destructive, and the pipeline never calls it: it is the teardown half of
+        ``ensure_bucket``, so a test that creates a throwaway bucket can remove
+        it again. Without this the buckets accumulate for the lifetime of the
+        MinIO volume - emptying one leaves the bucket itself behind.
+
+        Empties first because S3 refuses to delete a non-empty bucket, and a
+        test that failed part-way through will have left objects in it.
+        """
+        # Checked up front rather than by catching NoSuchBucket off the delete:
+        # the emptying pass runs first, so a missing bucket would otherwise
+        # surface as a listing failure and never reach the delete at all.
+        try:
+            self._client.head_bucket(Bucket=bucket)
+        except ClientError as exc:
+            if _error_code(exc) in _NOT_FOUND_CODES:
+                return False
+            raise ObjectStoreError(f"could not stat bucket {bucket!r}: {exc}") from exc
+        except BotoCoreError as exc:
+            raise ObjectStoreError(f"could not reach object storage: {exc}") from exc
+
+        for key in list(self.list_keys(bucket)):
+            self.delete_object(bucket, key)
+
+        try:
+            self._client.delete_bucket(Bucket=bucket)
+        except ClientError as exc:
+            raise ObjectStoreError(f"could not delete bucket {bucket!r}: {exc}") from exc
+        except BotoCoreError as exc:
+            raise ObjectStoreError(f"could not reach object storage: {exc}") from exc
+
+        logger.info("deleted bucket", extra={"bucket": bucket})
+        return True
+
     # ------------------------------------------------------------------
     # Objects
     # ------------------------------------------------------------------
