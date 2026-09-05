@@ -143,14 +143,34 @@ def main(argv: list[str] | None = None) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
 
+    # A run stopped early by --limit is short on purpose, so it is not a
+    # failure. Anything else that came up short was never searched.
+    complete = stats.get("wrc/crawl_complete", True) or stats.get(
+        "wrc/crawl_truncated", False
+    )
+
     print(
         f"\nfound={stats['wrc/found']}  stored={stats['wrc/stored']}  "
         f"unchanged={stats['wrc/unchanged']}  failed={stats['wrc/failed']}  "
         f"duplicate_rows={stats.get('wrc/duplicate_rows', 0)}  "
-        f"reconciles={stats['wrc/reconciles']}\n",
+        f"reconciles={stats['wrc/reconciles']}  "
+        f"crawl_complete={complete}\n",
         file=sys.stderr,
     )
-    return 0 if stats["wrc/reconciles"] else 1
+
+    if not complete:
+        # Reported separately from the reconciliation because it is a different
+        # failure: the counts below add up, there are just fewer of them than
+        # the requested range should have produced.
+        print(
+            f"Searched {stats.get('wrc/units_resolved', 0)} of "
+            f"{stats.get('wrc/crawl_units', 0)} (partition, body) units; the "
+            f"rest were never searched, so these counts cover less than the "
+            f"range requested.\n",
+            file=sys.stderr,
+        )
+
+    return 0 if (stats["wrc/reconciles"] and complete) else 1
 
 
 def _format_for(path: str) -> str:

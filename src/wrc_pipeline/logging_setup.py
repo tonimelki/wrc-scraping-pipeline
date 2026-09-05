@@ -88,6 +88,12 @@ class Event:
 
     RUN_STARTED = "run.started"
     RUN_SUMMARY = "run.summary"
+    # The crawl ended without searching every (partition, body) unit it set out
+    # to. Distinct from a reconciliation mismatch: that means the numbers do not
+    # add up, this means there are fewer numbers than there should be. A run
+    # that aborts before issuing any request reconciles perfectly at zero, so
+    # only this event catches it.
+    RUN_INCOMPLETE = "run.incomplete"
 
     PARTITION_STARTED = "partition.started"
     PARTITION_COMPLETED = "partition.completed"

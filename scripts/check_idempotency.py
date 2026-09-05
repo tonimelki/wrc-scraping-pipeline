@@ -243,6 +243,18 @@ def main(argv: list[str] | None = None) -> int:
     check("run 1 reconciled", bool(first["reconciles"]))
     check("run 2 reconciled", bool(second["reconciles"]))
 
+    # 7. And both runs actually searched the range. Asserted separately because
+    # reconciliation holds trivially for a crawl that did nothing: without this,
+    # two aborted runs would agree perfectly about having stored nothing and the
+    # check would report idempotency it never tested.
+    for label, stats in (("run 1", first), ("run 2", second)):
+        check(
+            f"{label} searched the whole range",
+            bool(stats.get("crawl_complete", True)),
+            f"searched {stats.get('units_resolved', '?')} of "
+            f"{stats.get('crawl_units', '?')} (partition, body) units",
+        )
+
     print("\n" + "-" * 62)
     if _failures:
         print(f"FAIL - {len(_failures)} assertion(s) failed:")

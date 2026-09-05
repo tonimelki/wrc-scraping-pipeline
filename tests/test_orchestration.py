@@ -219,3 +219,114 @@ def test_the_mongo_resource_closes_its_connection():
     assert hasattr(MongoResource, "store")
     # The contextmanager decorator is what guarantees close() runs on exit.
     assert MongoResource.store.__wrapped__.__name__ == "store"
+
+
+# --------------------------------------------------------------------------
+# The landing asset's failure conditions
+#
+# `reconciles` is an identity - found == scraped + failed + duplicates - so it
+# holds trivially when every term is zero. A crawl that aborted before issuing a
+# request therefore reports reconciles=True, and without a second check the
+# partition materialises green and empty. That happened: a run whose Mongo
+# pipeline could not open recorded found=0 and was recorded as a success.
+# --------------------------------------------------------------------------
+
+
+class RecordingContext(FakeContext):
+    """A FakeContext that also captures metadata, as the asset body needs."""
+
+    def __init__(self, start: date, end: date, partition_key: str = "2024-01-01"):
+        super().__init__(start, end)
+        self.partition_key = partition_key
+        self.run_id = "TEST-RUN"
+        self.metadata: dict = {}
+        self.log = _SilentLog()
+
+    def add_output_metadata(self, metadata) -> None:
+        self.metadata.update(metadata)
+
+
+class _SilentLog:
+    def info(self, *args, **kwargs) -> None:
+        pass
+
+
+def _landing_fn():
+    """The undecorated asset body, so it can be called with a FakeContext."""
+    return landing_documents.op.compute_fn.decorated_fn
+
+
+def _stats(**overrides) -> dict:
+    base = {
+        "found": 300,
+        "stored": 300,
+        "unchanged": 0,
+        "failed": 0,
+        "duplicate_rows": 0,
+        "reconciles": True,
+        "crawl_units": 4,
+        "units_resolved": 4,
+        "crawl_complete": True,
+    }
+    return {**base, **overrides}
+
+
+def test_a_partition_that_was_never_searched_fails(monkeypatch):
+    """The regression test: zero counters reconcile, so this must be caught.
+
+    Otherwise an outage produces a green partition indistinguishable from the
+    genuinely empty months that make up most of this corpus.
+    """
+    import wrc_pipeline.orchestration.assets as assets_module
+
+    aborted = _stats(
+        found=0, stored=0, unchanged=0, failed=0,
+        reconciles=True, units_resolved=0, crawl_complete=False,
+    )
+    monkeypatch.setattr(assets_module, "run_crawl", lambda *a, **k: aborted)
+
+    context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
+
+    with pytest.raises(RuntimeError, match="not fully searched"):
+        _landing_fn()(context, settings=None)
+
+
+def test_an_empty_but_searched_partition_succeeds(monkeypatch):
+    """The case the check must not break: a month with no decisions in it."""
+    import wrc_pipeline.orchestration.assets as assets_module
+
+    empty = _stats(found=0, stored=0, reconciles=True, crawl_complete=True)
+    monkeypatch.setattr(assets_module, "run_crawl", lambda *a, **k: empty)
+
+    context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
+    _landing_fn()(context, settings=None)
+
+    assert context.metadata["found"] == 0
+    assert context.metadata["crawl_complete"] is True
+
+
+def test_a_mismatched_partition_still_fails(monkeypatch):
+    """The original reconciliation check has to keep working alongside it."""
+    import wrc_pipeline.orchestration.assets as assets_module
+
+    mismatched = _stats(found=300, stored=299, reconciles=False)
+    monkeypatch.setattr(assets_module, "run_crawl", lambda *a, **k: mismatched)
+
+    context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
+
+    with pytest.raises(RuntimeError, match="did not reconcile"):
+        _landing_fn()(context, settings=None)
+
+
+def test_completeness_is_reported_as_metadata(monkeypatch):
+    """Visible in the UI, so a reviewer sees coverage next to the counts."""
+    import wrc_pipeline.orchestration.assets as assets_module
+
+    monkeypatch.setattr(assets_module, "run_crawl", lambda *a, **k: _stats())
+
+    context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
+    _landing_fn()(context, settings=None)
+
+    assert context.metadata["crawl_units"] == 4
+    assert context.metadata["units_resolved"] == 4
+    assert context.metadata["crawl_complete"] is True

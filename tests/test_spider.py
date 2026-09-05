@@ -399,3 +399,206 @@ def test_duplicate_rows_are_counted_in_the_reconciliation(spider):
     unchanged = sum(spider._unchanged.values())
 
     assert found == stored + unchanged + len(spider._failures) + len(spider._duplicate_rows)
+
+
+# --------------------------------------------------------------------------
+# Did the crawl actually search anything?
+#
+# The reconciliation is an identity - found == scraped + failed + duplicates -
+# and every term is zero for a run that aborted before issuing a request, so it
+# reads True. That is not theoretical: a crawl whose Mongo pipeline failed to
+# open recorded found=0, failed=0, reconciles=True and was materialised as a
+# green, empty partition. Since three of the four bodies genuinely are empty for
+# most dates, nothing downstream could tell the two apart.
+# --------------------------------------------------------------------------
+
+
+class FakeStats:
+    """Scrapy's stats collector, reduced to the one method `closed` uses."""
+
+    def __init__(self) -> None:
+        self.values: dict = {}
+
+    def set_value(self, key, value) -> None:
+        self.values[key] = value
+
+
+class FakeCrawler:
+    def __init__(self) -> None:
+        self.stats = FakeStats()
+
+
+def _failure_for(request):
+    """A Twisted Failure, reduced to what `handle_error` reads off it."""
+
+    class Failure:
+        def __init__(self) -> None:
+            self.request = request
+            self.value = ConnectionRefusedError("connection refused")
+            self.type = ConnectionRefusedError
+
+        def getErrorMessage(self) -> str:  # noqa: N802 - Twisted's spelling
+            return "connection refused"
+
+    return Failure()
+
+
+def close_and_get_stats(spider) -> dict:
+    """Run the spider's summary and return its stats without the wrc/ prefix."""
+    spider.crawler = FakeCrawler()
+    spider.closed("finished")
+    return {
+        key.removeprefix("wrc/"): value
+        for key, value in spider.crawler.stats.values.items()
+    }
+
+
+def test_a_crawl_that_searched_nothing_is_reported_incomplete(spider):
+    """The regression test for the bug this whole section exists for.
+
+    Every counter is zero, so the reconciliation passes. Only crawl_complete
+    distinguishes this from a month that genuinely held no decisions.
+    """
+    stats = close_and_get_stats(spider)
+
+    assert stats["reconciles"] is True, "the identity holds trivially at zero"
+    assert stats["crawl_complete"] is False, "but nothing was actually searched"
+    assert stats["crawl_units"] == 1
+    assert stats["units_resolved"] == 0
+
+
+def test_an_empty_month_that_was_actually_searched_is_complete(spider):
+    """The case that must NOT be broken by the check above.
+
+    An empty slice is normal - the Equality Tribunal and the EAT were folded
+    into the WRC in 2015 - so it has to stay a clean, green run.
+    """
+    list(spider.parse(make_response(spider, "search_results_empty.html")))
+
+    stats = close_and_get_stats(spider)
+
+    assert stats["found"] == 0
+    assert stats["reconciles"] is True
+    assert stats["crawl_complete"] is True, "searched and found nothing is fine"
+
+
+def test_a_first_page_that_errored_still_counts_as_searched(spider):
+    """The unit was attempted, so the failure is what should be reported.
+
+    Marking it unresolved as well would produce two complaints about one event,
+    and the reconciliation already fails here because found=0 but failed=1.
+    """
+    partition = build_partitions(date(2024, 1, 1), date(2024, 1, 31), "monthly")[0]
+    request = Request(
+        spider._search_url(partition, 3, 1),
+        meta={
+            "partition_date": partition.key,
+            "body": "labour_court",
+            "page": 1,
+        },
+    )
+    spider.handle_error(_failure_for(request))
+
+    stats = close_and_get_stats(spider)
+
+    assert stats["crawl_complete"] is True, "attempted and errored is not unsearched"
+    assert stats["failed"] == 1
+    assert stats["reconciles"] is False, "found=0 but failed=1 does not add up"
+
+
+def test_a_failed_detail_request_does_not_mark_a_unit_searched(spider):
+    """Detail requests carry `item`; only the first search page resolves a unit.
+
+    Without the distinction, one failed document would make an otherwise
+    aborted crawl look like it had covered its slice.
+    """
+    request = Request(
+        "https://www.workplacerelations.ie/en/cases/2024/january/adj-1.html",
+        meta={
+            "partition_date": "2024-01-01",
+            "body": "labour_court",
+            "page": 1,
+            "item": {"identifier": "ADJ-00000001"},
+        },
+    )
+    spider.handle_error(_failure_for(request))
+
+    stats = close_and_get_stats(spider)
+
+    assert stats["units_resolved"] == 0
+    assert stats["crawl_complete"] is False
+
+
+def test_a_partially_searched_run_is_incomplete(settings):
+    """One body searched, three never reached: the counts describe a fraction.
+
+    They would reconcile perfectly, because the units that never ran contribute
+    nothing to either side of the identity.
+    """
+    spider = WrcDecisionsSpider(
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        settings=settings,
+        run_id="TEST-RUN",
+    )
+    assert spider.crawl_units == 4, "all four bodies by default"
+
+    list(spider.parse(make_response(spider, "search_results_empty.html")))
+
+    stats = close_and_get_stats(spider)
+
+    assert stats["units_resolved"] == 1
+    assert stats["crawl_complete"] is False
+    assert stats["reconciles"] is True, "which is exactly why the check is needed"
+
+
+def test_crawl_units_is_known_before_the_crawl_starts(settings):
+    """A run that aborts has to be able to say what it was going to do."""
+    spider = WrcDecisionsSpider(
+        start_date="2024-01-01",
+        end_date="2024-03-31",
+        bodies="labour_court,workplace_relations_commission",
+        settings=settings,
+        run_id="TEST-RUN",
+    )
+
+    assert spider.crawl_units == 6, "3 monthly partitions x 2 bodies"
+
+
+def test_a_run_stopped_by_limit_is_short_but_not_broken(settings):
+    """--limit sets CLOSESPIDER_ITEMCOUNT, so the crawl ends on purpose.
+
+    crawl_complete stays honest - the units really were not all searched - but
+    crawl_truncated says why, so a smoke test does not report itself as a
+    failed run.
+    """
+    spider = WrcDecisionsSpider(
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        settings=settings,
+        run_id="TEST-RUN",
+    )
+    list(spider.parse(make_response(spider, "search_results_empty.html")))
+
+    spider.crawler = FakeCrawler()
+    spider.closed("closespider_itemcount")
+    stats = {
+        key.removeprefix("wrc/"): value
+        for key, value in spider.crawler.stats.values.items()
+    }
+
+    assert stats["crawl_complete"] is False, "the fact stays true to itself"
+    assert stats["crawl_truncated"] is True, "and this is why it is acceptable"
+
+
+def test_an_aborted_run_is_not_marked_truncated(spider):
+    """Only a deliberate stop sets the flag that excuses an incomplete crawl."""
+    spider.crawler = FakeCrawler()
+    spider.closed("finished")
+    stats = {
+        key.removeprefix("wrc/"): value
+        for key, value in spider.crawler.stats.values.items()
+    }
+
+    assert stats["crawl_complete"] is False
+    assert stats["crawl_truncated"] is False, "nothing excuses this one"

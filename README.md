@@ -129,8 +129,9 @@ Useful flags: `--bodies labour_court` restricts to one body (default: all four),
 `--output items.jsonl` also writes the scraped items, `--limit N` stops early
 for a smoke test, `--stats-json run.json` writes machine-readable counters.
 
-Both commands exit non-zero if the run did not reconcile, so either can gate a
-CI step without anyone reading the logs.
+Both commands exit non-zero if the run did not reconcile **or** did not search
+every partition it was asked to, so either can gate a CI step without anyone
+reading the logs.
 
 ---
 
@@ -140,12 +141,14 @@ CI step without anyone reading the logs.
 python scripts/check_idempotency.py 2024-02-01 2024-02-29 --bodies labour_court
 ```
 
-Runs the ingestion twice and asserts eleven things about the second run: that it
-stored nothing, that every stored file is still byte-identical (re-hashed *from
-storage*, not trusting the recorded hash), that `first_seen_at` was never
-rewritten, and that `last_seen_at` **was** — which is what proves the second run
-genuinely revisited the records rather than crashing early. Add `--fresh` if the
-range has already been ingested.
+Runs the ingestion twice and asserts thirteen things about the second run: that
+it stored nothing, that every stored file is still byte-identical (re-hashed
+*from storage*, not trusting the recorded hash), that `first_seen_at` was never
+rewritten, that `last_seen_at` **was** — which is what proves the second run
+genuinely revisited the records rather than crashing early — and that both runs
+searched the whole range, so two crawls that each did nothing cannot agree with
+each other and call it idempotency. Add `--fresh` if the range has already been
+ingested.
 
 Other checks:
 
@@ -248,6 +251,17 @@ Every run ends with a `run.summary` event reconciling
 itemised by URL and reason. Events use a fixed vocabulary
 (`logging_setup.Event`), so logs can be queried by `event` and the summary counts
 what the pipeline actually emitted.
+
+The summary also carries `crawl_complete`, which answers a question the
+reconciliation cannot. That equation is an identity, so it holds at
+`0 == 0`: a run that aborted before issuing a single request reports
+`reconciles: true` and looks like a month with no decisions in it — and since
+three of the four bodies genuinely are empty for most dates, nothing downstream
+could tell the difference. `crawl_complete` compares the `(partition, body)`
+units that produced a search page or a recorded failure against the number the
+run set out to search, so an aborted crawl is a failed one. A run stopped
+deliberately by `--limit` reports `crawl_truncated` instead and is not treated
+as a failure.
 
 ---
 

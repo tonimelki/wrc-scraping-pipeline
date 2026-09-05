@@ -117,6 +117,19 @@ class WrcDecisionsSpider(scrapy.Spider):
         self._pages_fetched = 0
         self._branches: dict[str, int] = {"html": 0, "attachment": 0}
 
+        # (partition_key, body) units whose first search page came back - either
+        # parsed, or errored into handle_error.
+        #
+        # The found-vs-scraped rule cannot police a run that never started: with
+        # every counter at zero, `found == scraped + failed + duplicates` reads
+        # 0 == 0 and the run reports success. That is not hypothetical - a crawl
+        # whose Mongo pipeline failed to open aborted before issuing a single
+        # request and was recorded as a green, empty partition, which is
+        # indistinguishable from the genuinely empty months that make up most of
+        # this corpus. Tracking which units actually resolved separates "this
+        # slice has no decisions" from "this slice was never searched".
+        self._units_resolved: set[tuple[str, str]] = set()
+
         # detail_urls already followed in this run.
         #
         # The site's own results can list the same document twice: January 2024
@@ -136,6 +149,16 @@ class WrcDecisionsSpider(scrapy.Spider):
         # quietly reintroduced.
         self._seen_identifiers: dict[str, str] = {}
         self._identifier_collisions: list[dict[str, Any]] = []
+
+    @property
+    def crawl_units(self) -> int:
+        """How many (partition, body) searches this run intends to perform.
+
+        Known at construction, not at ``start()``: a run that aborts before
+        emitting a request still has to be able to say what it was going to do,
+        which is the whole point of comparing it against what it did.
+        """
+        return len(self.partitions) * len(self.bodies)
 
     # ------------------------------------------------------------------
     # Setup
@@ -273,6 +296,8 @@ class WrcDecisionsSpider(scrapy.Spider):
         context = {"partition_date": partition.key, "body": body, "page": page}
 
         self._pages_fetched += 1
+        if page == 1:
+            self._units_resolved.add(slice_key)
         rows = response.css("li.each-item")
 
         self.logger.debug(
@@ -822,6 +847,17 @@ class WrcDecisionsSpider(scrapy.Spider):
         response = getattr(failure.value, "response", None)
         status = getattr(response, "status", None)
 
+        # A first search page that errored still counts as resolved: the unit
+        # was attempted and the failure is recorded below, so the reconciliation
+        # will catch it. What must not pass unnoticed is a unit that produced
+        # neither a page nor an error. Detail and attachment requests carry
+        # "item" in meta; search requests do not.
+        if item is None and request.meta.get("page") == 1:
+            partition_date = request.meta.get("partition_date")
+            body = request.meta.get("body")
+            if partition_date is not None and body is not None:
+                self._units_resolved.add((partition_date, body))
+
         self.note_failure(
             identifier=(item["identifier"] if item else "<page request>"),
             url=request.url,
@@ -853,6 +889,18 @@ class WrcDecisionsSpider(scrapy.Spider):
         failed = len(self._failures)
         duplicates = len(self._duplicate_rows)
         scraped = stored + unchanged
+
+        # Did the crawl actually search everything it set out to search? This is
+        # a separate question from whether the numbers add up, and the arithmetic
+        # cannot answer it: an aborted run has nothing to add up.
+        units_resolved = len(self._units_resolved)
+        crawl_complete = units_resolved == self.crawl_units
+        # Scrapy's CloseSpider extensions - which is how --limit stops a smoke
+        # test - end the crawl on purpose. Recorded as a separate fact rather
+        # than folded into crawl_complete: the crawl really did not search
+        # everything, and saying otherwise would be a lie in the stats. Callers
+        # decide whether an intentional stop should fail them.
+        crawl_truncated = reason.startswith("closespider")
 
         mismatches = [
             {
@@ -891,11 +939,33 @@ class WrcDecisionsSpider(scrapy.Spider):
                 ("duplicate_rows", duplicates),
                 ("possible_missed_records", duplicates),
                 ("reconciles", found == scraped + failed + duplicates),
+                ("crawl_units", self.crawl_units),
+                ("units_resolved", units_resolved),
+                ("crawl_complete", crawl_complete),
+                ("crawl_truncated", crawl_truncated),
                 ("identifier_collisions", len(self._identifier_collisions)),
                 ("branch_html", self._branches["html"]),
                 ("branch_attachment", self._branches["attachment"]),
             ):
                 self.crawler.stats.set_value(f"wrc/{name}", value)
+
+        if not crawl_complete and not crawl_truncated:
+            self.logger.error(
+                "crawl did not search every unit it set out to",
+                extra={
+                    "event": Event.RUN_INCOMPLETE,
+                    "crawl_units": self.crawl_units,
+                    "units_resolved": units_resolved,
+                    "units_missing": self.crawl_units - units_resolved,
+                    "close_reason": reason,
+                    "detail": (
+                        "every (partition, body) unit should have produced a "
+                        "search page or a recorded failure; those that produced "
+                        "neither were never searched, so this run's counts "
+                        "describe less than the requested range"
+                    ),
+                },
+            )
 
         if duplicates:
             # The arithmetic balances - a repeated row is not a lost record in
@@ -931,6 +1001,13 @@ class WrcDecisionsSpider(scrapy.Spider):
                 "partitions": len(self.partitions),
                 "bodies": sorted(self.bodies),
                 "pages_fetched": self._pages_fetched,
+                # How much of the requested range was actually searched. Read
+                # this before the counts below: if the crawl is incomplete they
+                # describe a smaller range than the one asked for.
+                "crawl_units": self.crawl_units,
+                "units_resolved": units_resolved,
+                "crawl_complete": crawl_complete,
+                "crawl_truncated": crawl_truncated,
                 "found": found,
                 "scraped": scraped,
                 "stored": stored,
@@ -945,7 +1022,8 @@ class WrcDecisionsSpider(scrapy.Spider):
                 # were probably not served this run. Reported separately from
                 # `failed`, because nothing failed - the source was inconsistent.
                 "possible_missed_records": duplicates,
-                # The single number a reviewer checks first.
+                # Checked second, after crawl_complete: this says the records
+                # the run saw are all accounted for, not that it saw them all.
                 "reconciles": found == scraped + failed + duplicates,
                 "slices_not_reconciling": mismatches,
                 "failures": self._failures,

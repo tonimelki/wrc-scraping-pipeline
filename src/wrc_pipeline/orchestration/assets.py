@@ -105,6 +105,9 @@ def landing_documents(
             "failed": stats["failed"],
             "duplicate_rows": stats.get("duplicate_rows", 0),
             "reconciles": stats["reconciles"],
+            "crawl_units": stats.get("crawl_units", 0),
+            "units_resolved": stats.get("units_resolved", 0),
+            "crawl_complete": stats.get("crawl_complete", True),
             "branch_html": stats.get("branch_html", 0),
             "branch_attachment": stats.get("branch_attachment", 0),
             "elapsed_seconds": stats.get("scrapy", {}).get("elapsed_time_seconds"),
@@ -113,6 +116,20 @@ def landing_documents(
             "failures": MetadataValue.json(stats.get("failures", [])),
         }
     )
+
+    # Checked before the reconciliation, because it is the stronger claim: the
+    # arithmetic below holds trivially for a run that searched nothing, so an
+    # aborted crawl would otherwise materialise green as an empty partition -
+    # indistinguishable from the genuinely empty months this corpus is full of.
+    if not stats.get("crawl_complete", True) and not stats.get(
+        "crawl_truncated", False
+    ):
+        raise RuntimeError(
+            f"partition {context.partition_key} was not fully searched: "
+            f"{stats.get('units_resolved', 0)} of {stats.get('crawl_units', 0)} "
+            f"(partition, body) units produced a search page or a recorded "
+            f"failure. The counts for this run cover less than the partition."
+        )
 
     if not stats["reconciles"]:
         raise RuntimeError(
