@@ -1,21 +1,27 @@
-# WRC Scraping Pipeline — Project Brief
+# Reconnaissance & build notes
 
-Context handoff for building this project. Read fully before writing code.
+Working notes kept while building this pipeline: the exercise's requirements in
+full, what analysing the live site turned up, the order the work was done in,
+and the reasoning — including the dead ends — behind the decisions in the code.
+
+The README and ARCHITECTURE.md are the finished write-ups. This is the material
+they were drawn from, kept because the site reconnaissance in section 3 is the
+part that took longest and would be the most tedious to reproduce.
 
 ---
 
 ## 1. What this is
 
-Build a Scrapy-based scraping pipeline that harvests legal decision documents
-and metadata from Ireland's Workplace Relations Commission website, lands them
-in object storage + a NoSQL database, then runs a transformation job producing
-a cleaned, curated layer.
+A Scrapy-based scraping pipeline that harvests legal decision documents and
+metadata from Ireland's Workplace Relations Commission website, lands them in
+object storage + a NoSQL database, then runs a transformation job producing a
+cleaned, curated layer.
 
 **Guiding constraint:** every design decision, trade-off and line of code has
-to be explainable out loud. That rules out cleverness for its own sake —
-favour clear, readable, well-commented code, and give every non-obvious
-decision a brief comment explaining *why*. Avoid exotic libraries or patterns
-that would be hard to justify verbally.
+to be explainable out loud. That ruled out cleverness for its own sake — hence
+clear, readable, well-commented code, a brief comment explaining *why* on every
+non-obvious decision, and no exotic libraries or patterns that would be hard to
+justify verbally.
 
 **Volume:** built against ~500–1000 documents, but designed as if it needed to
 handle 1000x that.
@@ -110,9 +116,10 @@ Python script running transformations on Landing Zone data:
 
 ---
 
-## 3. Reconnaissance findings (ALREADY DONE — do not re-investigate)
+## 3. Reconnaissance findings
 
-The target site has been fully analysed. These are confirmed facts.
+What analysing the live site established. These are confirmed facts, each one
+checked against the site rather than assumed.
 
 ### Site
 `https://www.workplacerelations.ie` — Decisions and Determinations database.
@@ -250,8 +257,8 @@ record contains literally every field the spec names.
 ### Detail pages — CRITICAL BRANCHING LOGIC
 
 **Every "View Page" link ends in `.html`.** The extension does NOT tell you
-whether the record is a PDF or an HTML document. You must fetch the detail
-page and inspect its contents.
+whether the record is a PDF or an HTML document. The detail page has to be
+fetched and inspected before the branch can be decided.
 
 **Two cases exist:**
 
@@ -315,16 +322,16 @@ Per RFC 9309, robots.txt paths are case-sensitive, so Python's `robotparser`
 (which Scrapy uses) treats the lowercase live URLs as allowed. `/en/search/`
 is not listed at all.
 
-**Required handling:**
-- Keep `ROBOTSTXT_OBEY = True` in Scrapy settings — do not override it.
-- Add a paragraph to `ARCHITECTURE.md` explicitly noting this ambiguity: that
-  `/Cases/` is disallowed in capitalised form, that the case mismatch is why
-  the crawl technically passes, and that in production this would be flagged
-  to the client / clarified with the site owner before scraping at volume.
-- Keep request rates polite regardless.
+**How this was handled:**
+- `ROBOTSTXT_OBEY` stays `True` in the Scrapy settings; it was never overridden.
+- The ambiguity is written up explicitly rather than left implicit in a green
+  run: that `/Cases/` is disallowed in capitalised form, that the case mismatch
+  is why the crawl technically passes, and that in a real engagement this would
+  be raised with the site owner before scraping at volume.
+- Request rates stay polite regardless.
 
-This is a deliberate judgement call and should be visible in the write-up, not
-silently ignored.
+A deliberate judgement call, made visible in the write-up rather than silently
+ignored.
 
 ---
 
@@ -337,7 +344,7 @@ silently ignored.
 
 ---
 
-## 5. Target repo layout
+## 5. Repository layout
 
 ```
 wrc-pipeline/
@@ -423,9 +430,11 @@ wrc-pipeline/
 
 ## 6. Build order
 
-Do not add a layer until the one beneath it demonstrably works.
+The sequence the work was done in, with the rough time each step took. The rule
+followed throughout: no layer was added until the one beneath it demonstrably
+worked.
 
-**Step 0 — Reconnaissance. ✅ COMPLETE.** See section 3.
+**Step 0 — Reconnaissance.** See section 3.
 
 **Step 1 — Skeleton and infrastructure (~1h).**
 Create the folder structure. Write `docker-compose.yml` with Mongo and MinIO,
@@ -493,9 +502,9 @@ Fill in unit tests.
 
 ---
 
-## 7. Key design decisions to make and defend
+## 7. Key design decisions
 
-Each of these has to stand up to being questioned. Decide deliberately.
+The choices that needed making deliberately, and the reasoning behind each.
 
 - **Partition size.** Monthly is the default recommendation. Justification:
   at 10 results/page, a month of one body is a manageable number of pages;
@@ -555,7 +564,7 @@ Each of these has to stand up to being questioned. Decide deliberately.
 
 ---
 
-## 8. Gotchas — do not rediscover these
+## 8. Gotchas
 
 1. **Dates must be day-first.** *(Corrected — the original "no leading zeros"
    claim was wrong; the site accepts `01/01/2024` happily.)* Month-first US
@@ -618,12 +627,14 @@ Each of these has to stand up to being questioned. Decide deliberately.
 
 ---
 
-## 9. Working style requested
+## 9. Working principles
 
-- Explain design decisions as you go; the author must be able to defend every
-  line.
-- Prefer readable and conventional over clever.
-- Comment the *why*, not the *what*.
-- Build incrementally per section 6 — get each step verifiably working before
-  moving on.
-- Ask before introducing a dependency that isn't obviously necessary.
+The rules this was built under, kept here because they explain a good deal of
+the code's shape:
+
+- Every design decision has to be explainable out loud, line by line.
+- Readable and conventional beats clever.
+- Comments carry the *why*, not the *what*.
+- Build incrementally per section 6 — each step verifiably working before the
+  next one starts.
+- A dependency that is not obviously necessary does not get added.

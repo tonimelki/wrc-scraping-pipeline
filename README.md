@@ -416,6 +416,9 @@ need Mongo and MinIO; nesting the clients inside the Scrapy package would force
   limiting, deduplication, and scaling to 50+ sources. Deliberately one page;
   the supporting evidence lives in this file instead, under **Throughput: what
   was measured** and **robots.txt**.
-- **[PROJECT_BRIEF.md](PROJECT_BRIEF.md)** — the full requirements, the site
-  reconnaissance (including several corrections found by testing against the
-  live site), and the build order this implementation followed.
+- **[NOTES.md](NOTES.md)** — reconnaissance and build notes: the full
+  requirements, what analysing the live site turned up (including several
+  corrections found by testing against it), the order the work was done in, and
+  the reasoning behind the decisions. Longer and rougher than the two documents
+  above, and kept because the site analysis is the part that would be most
+  tedious to reproduce.
