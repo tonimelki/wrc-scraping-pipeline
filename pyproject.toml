@@ -49,6 +49,7 @@ orchestration = [
 ]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -59,6 +60,40 @@ where = ["src"]
 [tool.dagster]
 module_name = "wrc_pipeline.orchestration.definitions"
 code_location_name = "wrc_pipeline"
+
+# Linting. The exercise asks for Python best practices, and "the code looks
+# tidy" is a claim worth being able to re-check with one command rather than by
+# reading it.
+#
+# The ruleset is chosen, not inherited. Rules that catch mistakes are on:
+# pyflakes (F) for dead code and typos, bugbear (B) for real footguns,
+# isort (I), comprehensions (C4), blind-except (BLE) - which is what the
+# codebase's existing `# noqa: BLE001` comments were already written against -
+# and the non-pedantic half of simplify (SIM).
+#
+# Deliberately NOT on: the pyupgrade (UP) modernisation rules. They would
+# rewrite fourteen correct `timezone.utc` references to `UTC` and swap typing
+# imports around, producing a large diff that changes no behaviour. A linter
+# earns its place by finding problems, not by enforcing a dialect.
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "SIM", "BLE", "C4", "PIE"]
+ignore = [
+    # Line length is the formatter's concern, and the cases here are URLs and
+    # assertion messages in tests, which are worse when wrapped.
+    "E501",
+    # try/except//pass with a comment explaining why the failure is ignored is
+    # clearer at the call site than contextlib.suppress, which moves the
+    # reason away from the code it excuses.
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on construction failures and shadow names deliberately.
+"tests/*" = ["B011"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -15,7 +15,10 @@ from scrapy.exceptions import DropItem
 
 from wrc_pipeline.scraper.items import TRANSIENT_FIELDS, DecisionItem
 from wrc_pipeline.scraper.pipelines.dedup import ContentState, DeduplicationPipeline
-from wrc_pipeline.scraper.pipelines.download import DocumentStoragePipeline, _extension_for
+from wrc_pipeline.scraper.pipelines.download import (
+    DocumentStoragePipeline,
+    _extension_for,
+)
 from wrc_pipeline.scraper.pipelines.mongo_writer import MetadataWriterPipeline
 from wrc_pipeline.scraper.pipelines.validate import ValidationPipeline
 from wrc_pipeline.storage.hashing import sha256_bytes

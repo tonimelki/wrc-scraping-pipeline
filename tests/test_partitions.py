@@ -10,7 +10,9 @@ awkward ranges.
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta
+from itertools import pairwise
 
 import pytest
 
@@ -88,7 +90,9 @@ def test_partitions_are_ordered_and_contiguous(size: str, start: str, end: str):
     for partition in partitions:
         assert partition.start <= partition.end
 
-    for previous, current in zip(partitions, partitions[1:]):
+    # pairwise rather than zip(xs, xs[1:]): the two sequences differ in length
+    # by construction, so zip's strict= has no correct value here.
+    for previous, current in pairwise(partitions):
         assert current.start == previous.end + timedelta(days=1)
 
 
@@ -318,7 +322,10 @@ def test_partition_key_and_str_are_readable():
 def test_partition_is_immutable():
     """Nothing downstream should be able to rewrite a unit of work in flight."""
     partition = build_partitions(d("2024-01-01"), d("2024-01-31"), "monthly")[0]
-    with pytest.raises(Exception):
+    # The specific exception, not bare Exception: a blind assertion here would
+    # also pass if the line raised NameError from a typo, which would leave the
+    # immutability claim untested.
+    with pytest.raises(FrozenInstanceError):
         partition.start = d("2024-01-02")  # type: ignore[misc]
 
 

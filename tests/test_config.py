@@ -354,14 +354,14 @@ def test_scrapy_settings_are_derived_from_the_config_file(env):
     importlib.reload(scrapy_settings)
     shipped = load_settings(DEFAULT_CONFIG_FILE, load_env=False)
 
-    assert scrapy_settings.DOWNLOAD_DELAY == shipped.scraping.download_delay
-    assert scrapy_settings.CONCURRENT_REQUESTS == shipped.scraping.concurrent_requests
+    assert shipped.scraping.download_delay == scrapy_settings.DOWNLOAD_DELAY
+    assert shipped.scraping.concurrent_requests == scrapy_settings.CONCURRENT_REQUESTS
     assert (
-        scrapy_settings.AUTOTHROTTLE_TARGET_CONCURRENCY
-        == shipped.scraping.autothrottle_target_concurrency
+        shipped.scraping.autothrottle_target_concurrency
+        == scrapy_settings.AUTOTHROTTLE_TARGET_CONCURRENCY
     )
-    assert scrapy_settings.USER_AGENT == shipped.scraping.user_agent
-    assert scrapy_settings.RETRY_TIMES == shipped.scraping.retry_times
+    assert shipped.scraping.user_agent == scrapy_settings.USER_AGENT
+    assert shipped.scraping.retry_times == scrapy_settings.RETRY_TIMES
 
 
 def test_robots_is_obeyed_and_scrapys_logging_is_disabled(env):

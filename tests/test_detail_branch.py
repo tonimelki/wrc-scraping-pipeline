@@ -18,7 +18,6 @@ import pytest
 from scrapy.http import HtmlResponse, Request, Response
 
 from wrc_pipeline.config import DEFAULT_CONFIG_FILE, load_settings
-from wrc_pipeline.partitions import build_partitions
 from wrc_pipeline.scraper.items import DecisionItem
 from wrc_pipeline.scraper.spiders.wrc_decisions import WrcDecisionsSpider
 

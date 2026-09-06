@@ -178,7 +178,7 @@ Data is preserved in the named volumes. `docker compose down -v` deletes it too.
 pytest
 ```
 
-398 tests. The 31 needing containers are marked `integration` and **skip** rather
+417 tests. The 34 needing containers are marked `integration` and **skip** rather
 than fail when Docker is not running, so a fresh clone is green either way:
 
 ```bash
@@ -187,6 +187,26 @@ pytest -m integration
 
 Everything else runs offline against page fixtures captured verbatim from the
 live site, so the suite does not depend on what the WRC published this morning.
+
+### Linting
+
+```bash
+ruff check src tests scripts
+```
+
+The ruleset is in `pyproject.toml` and is chosen rather than inherited: the
+rules that catch mistakes are on (dead code, bugbear footguns, import order,
+blind excepts), and the pyupgrade dialect rules are off, because rewriting
+fourteen correct `timezone.utc` references to `UTC` is a large diff that changes
+no behaviour. Where a warning is suppressed, the `# noqa` carries the reason.
+
+### CI
+
+`.github/workflows/ci.yml` runs the linter, then the **whole** suite —
+integration tests included — against the project's own `docker compose` stack,
+on the oldest and newest Python the package claims to support. Reusing the
+compose file rather than GitHub's `services:` block means CI exercises exactly
+the stack this README tells you to run.
 
 ---
 
@@ -355,6 +375,7 @@ instead of accidental.
 ```
 ├── docker-compose.yml       Mongo + MinIO, named volumes
 ├── .env.example             required variables, no secrets
+├── .github/workflows/ci.yml lint + the full suite against real containers
 ├── config/settings.yaml     behavioural configuration
 ├── src/wrc_pipeline/
 │   ├── config.py            settings.yaml + .env -> one validated object

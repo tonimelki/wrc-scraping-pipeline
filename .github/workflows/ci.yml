@@ -1,0 +1,93 @@
+# Continuous integration for the WRC pipeline.
+#
+# Two jobs, because they answer different questions and a reviewer should be
+# able to see which one failed without reading a log:
+#
+#   lint  - does the code still satisfy the ruleset in pyproject.toml?
+#   test  - does it still work, against the real MongoDB and MinIO?
+#
+# The test job starts the project's own docker-compose stack rather than
+# GitHub's `services:` block. The compose file already defines both containers
+# with healthchecks, and reusing it means CI exercises the same stack the
+# README tells a reviewer to run - so "works in CI" and "works on my machine"
+# cannot drift apart.
+#
+# Nothing here scrapes the live site. The suite runs against captured fixtures
+# and local containers, so CI never puts load on a public service.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a reviewer trigger a run from the Actions tab without pushing.
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first: the older answer is not
+# worth the runner minutes once it is already stale.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Only ruff is needed to lint, so this job does not pay for Scrapy,
+      # Dagster and boto3 just to read the source.
+      - name: Install ruff
+        run: pip install "ruff>=0.6"
+
+      - name: Lint
+        run: ruff check src tests scripts
+
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One version failing should not hide the result for the other.
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling of the range pyproject.toml declares. The
+        # point of testing both is that `requires-python` is a claim, and an
+        # untested claim is a guess.
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The example file ships with working local defaults, which are also the
+      # defaults docker-compose.yml falls back to - so the two agree with no
+      # secrets in the repository and none needed in CI.
+      - name: Configure
+        run: cp .env.example .env
+
+      # --wait blocks until both containers report healthy, so the suite cannot
+      # start against a database that is still coming up and flake.
+      - name: Start MongoDB and MinIO
+        run: docker compose up -d --wait
+
+      - name: Install
+        run: pip install -e ".[dev,orchestration]"
+
+      # The whole suite, integration tests included. They skip themselves when
+      # the containers are unreachable, so a failure here means a real failure
+      # rather than a missing service.
+      - name: Test
+        run: pytest -v
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down -v

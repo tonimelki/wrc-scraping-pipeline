@@ -69,7 +69,17 @@ _STANDARD_RECORD_FIELDS = frozenset(
 # record. A ContextVar rather than a module-level dict so that the value is
 # never shared across threads by accident - Scrapy's reactor is single
 # threaded, but the transform job need not be.
-_run_context: ContextVar[dict[str, Any]] = ContextVar("wrc_run_context", default={})
+#
+# The empty-dict default is safe here only because of an invariant worth
+# stating: nothing ever mutates the bound dict in place. Every writer
+# (bind_context, clear_context, log_context) calls .set() with a freshly built
+# dict, and get_context() hands out a copy. A single `_run_context.get()[k] = v`
+# anywhere would poison this default for the whole process, which is what the
+# linter is warning about - so the rule is silenced with the reason, not
+# because the warning is wrong.
+_run_context: ContextVar[dict[str, Any]] = ContextVar(
+    "wrc_run_context", default={}  # noqa: B039
+)
 
 # Third-party libraries that are extremely chatty at DEBUG. Left at INFO so
 # that turning the pipeline's own level down to DEBUG stays readable instead of

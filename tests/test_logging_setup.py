@@ -126,9 +126,8 @@ def test_log_context_restored_even_when_body_raises(capture):
     lines, _ = capture
     log = get_logger("test")
 
-    with pytest.raises(ValueError):
-        with log_context(identifier="ADJ-BOOM"):
-            raise ValueError("download exploded")
+    with pytest.raises(ValueError), log_context(identifier="ADJ-BOOM"):
+        raise ValueError("download exploded")
     log.info("next record")
 
     assert "identifier" not in lines()[0]

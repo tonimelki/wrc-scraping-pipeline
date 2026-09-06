@@ -16,7 +16,7 @@ from typing import Any
 
 from scrapy.exceptions import DropItem
 
-from wrc_pipeline.logging_setup import Event, get_logger
+from wrc_pipeline.logging_setup import get_logger
 
 logger = get_logger(__name__)
 
