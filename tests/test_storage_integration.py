@@ -19,6 +19,7 @@ import uuid
 from datetime import date, datetime, timezone
 
 import pytest
+from pymongo import MongoClient
 
 from wrc_pipeline.storage.hashing import sha256_bytes
 from wrc_pipeline.storage.mongo import MetadataStore, MetadataStoreError, UpsertResult
@@ -238,6 +239,43 @@ def test_range_query_can_filter_by_body(store):
     ))
     assert len(found) == 1
     assert found[0]["body"] == "labour_court"
+
+
+# --------------------------------------------------------------------------
+# Indexes - the queries the pipeline makes on every write
+# --------------------------------------------------------------------------
+
+
+def test_the_curated_collision_guard_query_is_indexed(store, live_settings):
+    """``_guard_key_collision`` runs before every curated write.
+
+    Asserted through the query planner rather than by listing index names,
+    because the index existing is not the property that matters - the planner
+    choosing it is. Unindexed, this lookup is a collection scan, so the cost of
+    writing one document would grow with the size of the corpus.
+
+    ``explain`` is a diagnostic the pipeline itself never issues, so it is
+    driven straight from pymongo rather than by widening MetadataStore's API
+    for a test's benefit.
+    """
+    metadata, collection = store
+    metadata.upsert_metadata(collection, make_document(file_key="ADJ-00000001.html"))
+
+    with MongoClient(live_settings.mongo.uri) as client:
+        plan = (
+            client[live_settings.mongo.database][collection]
+            .find({"file_key": "ADJ-00000001.html"})
+            .explain()
+        )
+
+    stage = plan["queryPlanner"]["winningPlan"]
+    while "inputStage" in stage:
+        stage = stage["inputStage"]
+
+    assert stage["stage"] == "IXSCAN", f"collision guard is a {stage['stage']}"
+    assert stage["indexName"] == "idx_file_key"
+    # One key read, one document read - not the whole collection.
+    assert plan["executionStats"]["totalDocsExamined"] == 1
 
 
 # --------------------------------------------------------------------------

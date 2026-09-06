@@ -121,6 +121,23 @@ class MetadataStore:
                         "idx_partition_body",
                     ),
                     _index([("file_hash", ASCENDING)], "idx_file_hash"),
+                    # The transform's collision backstop looks a curated key up
+                    # by file_key before every write (see
+                    # transform.job._guard_key_collision). Without this index
+                    # that check is a collection scan, so the cost of writing
+                    # one document grows with the size of the corpus - the
+                    # worst scaling behaviour in the pipeline, and precisely
+                    # what the "1000x" note above exists to prevent.
+                    #
+                    # Deliberately NOT unique. A unique index would make the
+                    # no-overwrite guarantee structural rather than advisory,
+                    # which is tempting - but this method serves both zones,
+                    # and only the *curated* key is unique by construction.
+                    # Nothing stops two landing records from sharing one
+                    # attachment: two decisions published as a single combined
+                    # PDF would collide, and a unique index would turn that
+                    # into a hard ingestion failure instead of a stored record.
+                    _index([("file_key", ASCENDING)], "idx_file_key"),
                 ]
             )
         except PyMongoError as exc:
