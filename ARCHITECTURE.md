@@ -19,6 +19,13 @@ Scrapy's `RetryMiddleware`, 3 attempts, on 429/408/5xx. An exhausted retry
 reaches the spider's errback, is logged with URL and status, and is counted
 against the site's own result count — so it surfaces as a number, not a gap.
 
+**One failure is not an error code at all.** Under load the search endpoint
+`302`s to an error page, which returns `200` with no results — indistinguishable
+from an empty month, and empty months are most of this corpus. The spider
+therefore checks the response is still on the search path, retries the original
+URL on the same budget, and fails the slice rather than recording it as empty.
+Detail in the README.
+
 **AutoThrottle is the control, not a fixed delay**: a constant sleep answers
 "don't get blocked" but not "be fast". It measures real latency and converges on
 the concurrency the server tolerates; `DOWNLOAD_DELAY` is a floor beneath it.

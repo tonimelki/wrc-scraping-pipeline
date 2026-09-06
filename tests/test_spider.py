@@ -16,8 +16,9 @@ from pathlib import Path
 
 import pytest
 from scrapy.http import HtmlResponse, Request
+from scrapy.settings import Settings as ScrapySettings
 
-from wrc_pipeline.config import load_settings, DEFAULT_CONFIG_FILE
+from wrc_pipeline.config import DEFAULT_CONFIG_FILE, load_settings
 from wrc_pipeline.partitions import build_partitions
 from wrc_pipeline.scraper.spiders.wrc_decisions import WrcDecisionsSpider
 
@@ -242,6 +243,122 @@ def test_empty_slice_yields_nothing_and_is_not_an_error(spider, caplog):  # noqa
 
 
 # --------------------------------------------------------------------------
+# Redirected off the search endpoint - an empty slice's evil twin
+# --------------------------------------------------------------------------
+
+
+def make_redirected_response(spider: WrcDecisionsSpider, page: int = 1) -> HtmlResponse:
+    """A search request that the site answered with 302 to its error page.
+
+    The body is deliberately the *empty results* fixture: no count banner and
+    no rows, which is exactly what the error page looks like to the parser.
+    That is the whole difficulty - the content is indistinguishable from a
+    genuinely empty month, so only the URL gives it away.
+    """
+    partition = build_partitions(date(2024, 1, 1), date(2024, 1, 31), "monthly")[0]
+    original = spider._search_url(partition, 3, page)
+    landed = "https://www.workplacerelations.ie/ErrorPage.aspx"
+    request = Request(
+        landed,
+        meta={
+            "partition": partition,
+            "partition_date": partition.key,
+            "body": "labour_court",
+            "body_id": 3,
+            "page": page,
+            "redirect_urls": [original],
+        },
+    )
+    return HtmlResponse(
+        url=landed,
+        request=request,
+        body=(FIXTURES / "search_results_empty.html").read_bytes(),
+        encoding="utf-8",
+    )
+
+
+def test_a_redirect_off_the_search_endpoint_is_retried(spider):
+    """Observed live: the site 302s to /ErrorPage.aspx under load.
+
+    The same URL served its records again minutes later, so this is transient
+    and worth retrying rather than failing the partition over.
+    """
+    spider.crawler = FakeCrawler()
+    response = make_redirected_response(spider)
+
+    results = list(spider.parse(response))
+
+    assert len(results) == 1, "expected exactly one retry request"
+
+    retry = results[0]
+    # The URL we asked for, not the one we landed on. Retrying response.request
+    # would re-request the error page and burn the budget without ever trying
+    # the search again.
+    assert "/en/search/" in retry.url
+    assert "ErrorPage" not in retry.url
+    # The slice this retry belongs to has to survive, or its records come back
+    # stamped with the wrong partition.
+    assert retry.meta["partition_date"] == "2024-01-01"
+    assert retry.meta["body"] == "labour_court"
+    assert retry.meta["page"] == 1
+    # Redirect bookkeeping is dropped so the new attempt starts clean.
+    assert "redirect_urls" not in retry.meta
+
+    # Not recorded as an outcome yet - the retry may still succeed.
+    assert spider._found == {}
+    assert spider._failures == []
+
+
+def test_a_redirect_is_never_mistaken_for_an_empty_partition(spider):
+    """The failure this guards against reports found=0 and exits 0.
+
+    With the retries spent, the slice must be a *failure*: an empty partition
+    and a partition that was never searched are the same number and completely
+    different facts.
+    """
+    spider.crawler = FakeCrawler()
+    response = make_redirected_response(spider)
+    # Spend the retry budget, as Scrapy would have by the last attempt.
+    response.request.meta["retry_times"] = spider.settings_obj.scraping.retry_times
+
+    results = list(spider.parse(response))
+
+    assert results == [], "retries are exhausted; nothing more to schedule"
+    assert spider._found == {}, "a redirect must not be counted as 0 records found"
+
+    assert len(spider._failures) == 1
+    failure = spider._failures[0]
+    assert failure["reason"] == "redirected_off_search_endpoint"
+    assert "/en/search/" in failure["url"], "the failure names the URL we asked for"
+    assert failure["body"] == "labour_court"
+    assert failure["partition_date"] == "2024-01-01"
+
+
+def test_a_redirected_run_does_not_reconcile(spider):
+    """The end-to-end consequence, which is the point of the whole check.
+
+    Before this guard the run reported found=0, reconciles=true and exited 0
+    for a partition that had records - so the assertion that matters is not
+    that a failure was logged, but that the run refuses to call itself clean.
+    """
+    spider.crawler = FakeCrawler()
+    response = make_redirected_response(spider)
+    response.request.meta["retry_times"] = spider.settings_obj.scraping.retry_times
+
+    list(spider.parse(response))
+    spider.closed("finished")
+
+    stats = spider.crawler.stats.values
+    assert stats["wrc/reconciles"] is False
+    assert stats["wrc/failed"] == 1
+
+
+def test_a_normal_search_response_is_not_treated_as_a_redirect(spider):
+    """The guard must not fire on the happy path."""
+    assert spider._is_search_response(make_response(spider, "search_results_page.html"))
+
+
+# --------------------------------------------------------------------------
 # Malformed rows
 # --------------------------------------------------------------------------
 
@@ -422,10 +539,19 @@ class FakeStats:
     def set_value(self, key, value) -> None:
         self.values[key] = value
 
+    def inc_value(self, key, count=1, start=0) -> None:
+        """Scrapy's retry helper counts through this one."""
+        self.values[key] = self.values.get(key, start) + count
+
 
 class FakeCrawler:
     def __init__(self) -> None:
         self.stats = FakeStats()
+        # Scrapy's own retry helper reads the crawler's settings even when the
+        # retry budget is passed to it explicitly, so a real Settings object
+        # (which loads Scrapy's defaults on construction) is cheaper than
+        # stubbing each key the helper happens to touch.
+        self.settings = ScrapySettings()
 
 
 def _failure_for(request):

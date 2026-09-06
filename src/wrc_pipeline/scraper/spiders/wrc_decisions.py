@@ -33,9 +33,10 @@ import math
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Iterator
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import scrapy
+from scrapy.downloadermiddlewares.retry import get_retry_request
 from scrapy.http import Response
 
 from wrc_pipeline.config import Settings, get_settings
@@ -287,6 +288,105 @@ class WrcDecisionsSpider(scrapy.Spider):
                     errback=self.handle_error,
                 )
 
+    def _is_search_response(self, response: Response) -> bool:
+        """True if this response is still the search endpoint.
+
+        Compares paths rather than whole URLs: the request carries a query
+        string and the response may differ in case or trailing slash, none of
+        which mean anything. What matters is whether we are still on
+        ``/en/search/`` or have been sent somewhere else entirely.
+
+        This detects a redirect *away* from the search. It cannot detect an
+        error page served at the search path itself - that would need a
+        positive check on the page's structure, which trades this failure for a
+        false alarm every time the site's template changes. The observed
+        failure is a redirect, so that is what this checks.
+        """
+        expected = urlparse(self.settings_obj.source.search_url).path
+        actual = urlparse(response.url).path
+        return actual.rstrip("/").lower() == expected.rstrip("/").lower()
+
+    def _handle_off_search_response(
+        self,
+        response: Response,
+        context: dict[str, Any],
+        slice_key: tuple[str, str],
+    ) -> Iterator[scrapy.Request]:
+        """Retry a search that was redirected off the endpoint, then give up.
+
+        Retried rather than failed outright because the failure is transient:
+        the same URL that redirected to the error page served its 44 records
+        again two minutes later. A partition that fails the whole run over a
+        blip the site recovers from on its own would be its own kind of wrong.
+
+        ``get_retry_request`` reuses Scrapy's retry machinery rather than
+        inventing a second one, so this appears in the retry stats alongside
+        every other retry. The budget is passed explicitly from settings.yaml,
+        which is where every other tunable in this pipeline comes from - taking
+        it from Scrapy's own RETRY_TIMES would work, but it would be the one
+        setting that arrives by a different route.
+        """
+        redirected_from = response.meta.get("redirect_urls", [response.url])[0]
+
+        # Retry the URL we *asked* for, not the one we landed on.
+        #
+        # After a redirect ``response.request`` points at the error page, so
+        # retrying it directly would re-request the error page - spending the
+        # whole retry budget without ever attempting the search again. The
+        # redirect bookkeeping is dropped with it so the fresh attempt gets a
+        # full redirect allowance; ``retry_times`` is deliberately kept, since
+        # that is the budget being counted down.
+        search_request = response.request.replace(
+            url=redirected_from,
+            meta={
+                key: value
+                for key, value in response.meta.items()
+                if not key.startswith("redirect_")
+            },
+        )
+
+        retry = get_retry_request(
+            search_request,
+            spider=self,
+            reason="redirected_off_search_endpoint",
+            max_retry_times=self.settings_obj.scraping.retry_times,
+        )
+        if retry is not None:
+            self.logger.warning(
+                "search was redirected off the search endpoint; retrying",
+                extra={
+                    **context,
+                    "event": Event.RECORD_FAILED,
+                    "url": redirected_from,
+                    "landed_on": response.url,
+                    "status": response.status,
+                    "reason": "redirected_off_search_endpoint",
+                },
+            )
+            yield retry
+            return
+
+        # Out of retries. Recorded as a failure - not as an empty partition -
+        # so the reconciliation breaks and the run cannot exit 0. The unit is
+        # marked resolved on the same rule handle_error uses: it was attempted
+        # and the failure is on the record, which is what "resolved" means here.
+        if response.meta.get("page") == 1:
+            self._units_resolved.add(slice_key)
+
+        self.note_failure(
+            identifier="<search page>",
+            url=redirected_from,
+            reason="redirected_off_search_endpoint",
+            partition_date=context.get("partition_date"),
+            body=context.get("body"),
+            status_code=response.status,
+            message=(
+                "search kept being redirected off the search endpoint; "
+                "this slice was never searched"
+            ),
+            context={"page": context.get("page"), "landed_on": response.url},
+        )
+
     def parse(self, response: Response) -> Iterator[scrapy.Request]:
         """Parse one page of search results and follow each record."""
         partition: Partition = response.meta["partition"]
@@ -294,6 +394,23 @@ class WrcDecisionsSpider(scrapy.Spider):
         page: int = response.meta["page"]
         slice_key = (partition.key, body)
         context = {"partition_date": partition.key, "body": body, "page": page}
+
+        # Did we actually get a search page back?
+        #
+        # Observed on the live site: under load the search endpoint answers 302
+        # to /ErrorPage.aspx. Scrapy follows the redirect, the error page
+        # returns 200 with no result banner and no rows, and the "no banner AND
+        # no rows" rule below reads that as a legitimately empty slice. The run
+        # then reports found=0, reconciles=true, crawl_complete=true and exits
+        # 0 - for a partition that had 44 records two minutes earlier.
+        #
+        # None of the other safeguards catch it: the reconciliation is an
+        # identity at 0 == 0, and crawl_complete only asks whether a search page
+        # came back, which one did. So the check has to be that the response is
+        # still *on* the search endpoint.
+        if not self._is_search_response(response):
+            yield from self._handle_off_search_response(response, context, slice_key)
+            return
 
         self._pages_fetched += 1
         if page == 1:

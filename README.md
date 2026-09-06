@@ -268,7 +268,7 @@ as a failure.
 
 ---
 
-## Three things the site does that shaped the code
+## Four things the site does that shaped the code
 
 Each of these produces a pipeline that *looks* like it works, which is why they
 are worth stating.
@@ -288,6 +288,24 @@ Employment Appeals Tribunal were folded into the WRC in 2015; the WRC has
 nothing before 2016. An empty search renders no result-count banner *and* no
 rows, so that combination means an empty partition — logged as normal, never as
 an error.
+
+**Under load the search endpoint redirects to an error page.** Observed live: a
+search that had returned 44 records answered `302` to `/ErrorPage.aspx`, and
+returned the same 44 records again two minutes later. Scrapy follows the
+redirect and the error page is a `200` with no banner and no rows — which is
+character-for-character what the rule above calls an empty partition. Left
+unhandled the run reports `found=0`, `reconciles: true`, `crawl_complete: true`
+and exits `0`, and a nightly run that hit a throttling window would record
+"no decisions this month" with every downstream check agreeing.
+
+Neither existing safeguard catches it: the reconciliation is an identity, so it
+holds at `0 == 0`, and `crawl_complete` asks whether a search page came back —
+one did. So the spider checks that the response is still *on* the search path
+before parsing it, retries the original URL if not, and records a failure once
+the retries are spent. The comparison ignores case and trailing slashes,
+because the site also serves `/en/Search` → `/en/search/` as a `301` and that
+one is not a problem — verified by pointing `search_path` at the redirecting
+form and confirming the crawl still returns its 44 records.
 
 ---
 
