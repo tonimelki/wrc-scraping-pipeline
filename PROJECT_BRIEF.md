@@ -6,44 +6,40 @@ Context handoff for building this project. Read fully before writing code.
 
 ## 1. What this is
 
-A take-home coding exercise for a company called Kedra (Software Developer
-role). The task: build a Scrapy-based scraping pipeline that harvests legal
-decision documents and metadata from Ireland's Workplace Relations Commission
-website, lands them in object storage + a NoSQL database, then runs a
-transformation job producing a cleaned, curated layer.
+Build a Scrapy-based scraping pipeline that harvests legal decision documents
+and metadata from Ireland's Workplace Relations Commission website, lands them
+in object storage + a NoSQL database, then runs a transformation job producing
+a cleaned, curated layer.
 
-**Evaluation note from the brief:** "You may use AI tools freely, but you must
-be able to explain every design decision, trade-off, and line of code in your
-solution during the technical interview. We evaluate understanding, not just
-output."
+**Guiding constraint:** every design decision, trade-off and line of code has
+to be explainable out loud. That rules out cleverness for its own sake —
+favour clear, readable, well-commented code, and give every non-obvious
+decision a brief comment explaining *why*. Avoid exotic libraries or patterns
+that would be hard to justify verbally.
 
-This means: favour clear, readable, well-commented code over clever code.
-Every non-obvious decision needs a brief comment explaining *why*. Avoid
-exotic libraries or patterns that would be hard to justify verbally.
-
-**Volume:** evaluated against ~500–1000 documents, but must be designed as if
-it needed to handle 1000x that.
+**Volume:** built against ~500–1000 documents, but designed as if it needed to
+handle 1000x that.
 
 ---
 
-## 2. Full requirements (from the exercise PDF)
+## 2. Full requirements
 
 ### Scraping
 1. Use the **Scrapy framework**.
 2. **"Make sure to use the fastest way to scrape the URLs without getting
-   blocked."** This is requirement #1 in the PDF, quoted verbatim. Note that it
+   blocked."** This is requirement #1, quoted verbatim. Note that it
    asks for *speed*, not merely politeness — a fixed conservative sleep
    satisfies only half of it. See §7 "Rate limiting / throughput" for how the
    two halves are reconciled; it needs a paragraph in `ARCHITECTURE.md`.
 3. Scrape from each of the four "bodies" on the left filter panel; use the
-   start/finish date filters to partition the scraping process. (The PDF's
+   start/finish date filters to partition the scraping process. (The spec's
    annotated screenshot confirms exactly four: Employment Appeals Tribunal,
    Equality Tribunal, Labour Court, Workplace Relations Commission.)
 4. Scraper takes `start_date` and `end_date` inputs and iterates on a
    time-period basis between them (e.g. monthly partitions between 01-01-2024
    and 01-01-2025). Add a `partition_date` field to every record.
 5. Extract metadata for each record: title, description, identifier, date,
-   link to doc, partition_date, etc. (All are named in the PDF — including
+   link to doc, partition_date, etc. (All are named in the spec — including
    `title`. See "On the `title` field" in §3.)
 6. Store metadata in a NoSQL DB.
 7. Download and store document files in blob/object storage:
@@ -63,8 +59,8 @@ it needed to handle 1000x that.
 - **Orchestration:** Dagster, Airflow, or Modal. Ingestion and transformation
   must be orchestrated **"as separate tasks with proper dependency handling"**
   — two distinct tasks with an explicit edge between them, not one monolithic
-  job. CLI is acceptable but "using an orchestrator will carry significant
-  weight in the assessment."
+  job. A CLI alone would satisfy the letter of it; an orchestrator is what
+  the requirement is actually asking for.
 - **Configuration:** all connection strings, storage paths, partition sizes,
   and scraping parameters configurable via env vars or config file.
   **No hardcoded values.**
@@ -97,9 +93,9 @@ Python script running transformations on Landing Zone data:
 - Deduplication strategy
 - What would change to support 50+ sources
 
-### Additional tips from the brief
-- "Feel free to add additional steps in the Transformation logic for better
-  data quality." — explicitly invited extra credit. Candidates: normalise
+### Additional requirements
+- Additional steps in the transformation logic for better data quality are
+  explicitly invited. Candidates: normalise
   `published_date` to ISO-8601, trim the description's padding whitespace,
   record character counts / extraction outcome on cleaned HTML, and flag
   records whose cleaned body came out suspiciously short.
@@ -240,7 +236,7 @@ Field extraction:
 published `30/01/2024` but lives at `/en/cases/2024/**february**/lcr22912.html`.
 Derive nothing from the URL path — take the date from `span.date`.
 
-**On the `title` field.** The PDF's metadata list is "title, description
+**On the `title` field.** The spec's metadata list is "title, description
 identifier, date, link to doc, partition_date, etc." — but its annotated
 screenshot labels only four things on the results list (identifier,
 published_date, description, link to doc), so the *listing* page carries no
@@ -249,7 +245,7 @@ the identifier heading — e.g. "ADJUDICATION OFFICER Recommendation on dispute
 under Industrial Relations Act 1969". Capture it while parsing the detail page
 and store it as `title`; fall back to the identifier when the detail page is a
 bare PDF attachment with no heading. Cheap to do, and it means the metadata
-record contains literally every field the PDF names.
+record contains literally every field the spec names.
 
 ### Detail pages — CRITICAL BRANCHING LOGIC
 
@@ -280,7 +276,7 @@ Example: `https://www.workplacerelations.ie/en/cases/2008/september/ud1066_2007.
 **Case B — inline HTML content (modern records, e.g. ADJ decisions).**
 The decision text is rendered directly into the page. No attachment.
 
-The PDF's second screenshot boxes exactly what it counts as "relevant content"
+The spec's second screenshot boxes exactly what it counts as "relevant content"
 for the transformation step (§9 of the build order): the block beginning at the
 identifier heading (e.g. `IR - SC - 00001595`), then the document title, then
 the decision body. Explicitly **outside** the box: the English/Gaeilge language
@@ -399,7 +395,7 @@ wrc-pipeline/
     └── fixtures/sample_decision.html
 ```
 
-### Rationale for the layout (needed for interview defence)
+### Rationale for the layout
 - **`storage/` sits outside `scraper/`** because both the spider and the
   transformation job need Mongo and MinIO. Putting the clients inside the
   Scrapy package would force `transform` to import from `scraper` to reach a
@@ -470,7 +466,7 @@ Expect this to be the buggiest phase.
 Run one partition, record document count and a few hashes. Run the identical
 command again. Count unchanged; logs show skips not downloads. Fix here if
 broken — everything downstream inherits the bug, and this is the first thing
-the reviewer will test.
+anyone reading the code will test.
 
 **Step 8 — Scale up and tune (~2–3h).**
 All four bodies, full range. Enable AutoThrottle, conservative concurrency.
@@ -499,7 +495,7 @@ Fill in unit tests.
 
 ## 7. Key design decisions to make and defend
 
-These will be probed in the technical interview. Decide deliberately.
+Each of these has to stand up to being questioned. Decide deliberately.
 
 - **Partition size.** Monthly is the default recommendation. Justification:
   at 10 results/page, a month of one body is a manageable number of pages;
@@ -533,7 +529,7 @@ These will be probed in the technical interview. Decide deliberately.
   under the deduplication strategy — noticing it is the interesting part.
 - **Hash comparison point.** Check before writing: look up identifier, compare
   freshly-computed hash to stored hash, skip if equal.
-- **Rate limiting / throughput.** The PDF asks for "the fastest way to scrape
+- **Rate limiting / throughput.** The spec asks for "the fastest way to scrape
   the URLs without getting blocked" — both halves. A fixed conservative sleep
   answers only the second, so the control should be *adaptive*:
   `AUTOTHROTTLE_ENABLED = True` with a deliberately chosen
