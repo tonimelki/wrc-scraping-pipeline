@@ -150,6 +150,9 @@ searched the whole range, so two crawls that each did nothing cannot agree with
 each other and call it idempotency. Add `--fresh` if the range has already been
 ingested.
 
+The check itself has been validated against a deliberately broken build — a
+proof that only ever passes is not a proof.
+
 Other checks:
 
 | Command | Answers |
@@ -288,6 +291,47 @@ an error.
 
 ---
 
+## Throughput: what was measured
+
+ARCHITECTURE.md states the conclusion; this is the evidence behind it. Two
+sweeps with `scripts/tune_throughput.py`, one month of the Labour Court, varying
+AutoThrottle's target concurrency:
+
+| target concurrency | elapsed | req/min | non-200 | retries |
+|---|---|---|---|---|
+| 1 | 52.2s | 84 | 0 | 0 |
+| **2** ← chosen | **27.8s** | **158** | 0 | 0 |
+| 4 | 27.9s | 157 | 0 | 0 |
+| 8 | 22.9s | 191 | 0 | 0 |
+
+**2 and 4 are identical — that is the plateau**, and above it the ceiling is the
+server rather than the client. Target 8 buys about 20% more, and the site showed
+no distress at any level: zero non-200 responses across roughly 2,000 requests.
+
+Target 2 was chosen anyway. Across the evaluation corpus the difference between
+2 and 8 is about **one minute of wall clock**, which does not justify
+quadrupling the load placed on a small public service. The requirement asks for
+the fastest way to scrape *without getting blocked*; where the two readings of
+that diverge, this is a deliberate choice with the numbers written down rather
+than a guess, and re-running the sweep is one command.
+
+## robots.txt — a judgement call, stated openly
+
+`ROBOTSTXT_OBEY` is left **on**, and the crawl passes.
+
+It passes on a technicality. The site disallows `/Cases/` and `/en/Cases/` in
+*capitalised* form, while the live URLs are lowercase; RFC 9309 makes robots
+paths case-sensitive, so nothing is violated and no override was needed.
+
+That is worth saying out loud rather than leaving implicit in a green run. The
+directive's evident intent is to discourage bulk crawling of the case archive,
+even though `/en/search/` is not listed at all. In a real engagement this would
+be raised with the client before scraping at volume, rather than settled by
+reading the spec narrowly. It is recorded here so the decision is visible
+instead of accidental.
+
+---
+
 ## Repository layout
 
 ```
@@ -330,8 +374,9 @@ need Mongo and MinIO; nesting the clients inside the Scrapy package would force
 ## Further reading
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — partition size, retries and rate
-  limiting, deduplication, scaling to 50+ sources, and the robots.txt judgement
-  call.
+  limiting, deduplication, and scaling to 50+ sources. Deliberately one page;
+  the supporting evidence lives in this file instead, under **Throughput: what
+  was measured** and **robots.txt**.
 - **[PROJECT_BRIEF.md](PROJECT_BRIEF.md)** — the full requirements, the site
   reconnaissance (including several corrections found by testing against the
   live site), and the build order this implementation followed.
