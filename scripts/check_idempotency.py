@@ -36,9 +36,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from wrc_pipeline.config import ConfigError, Settings, load_settings
 from wrc_pipeline.partitions import PartitionError, parse_date
@@ -76,7 +80,7 @@ def snapshot(
     with MetadataStore.from_settings(settings) as store:
         records = list(
             store.find_by_range(
-                settings.mongo.landing_collection, start, end, body=body
+                settings.mongo.landing_collection, start, end, body=body, field="published_date"
             )
         )
 
@@ -111,7 +115,8 @@ def ingest(args: argparse.Namespace, label: str) -> dict[str, Any]:
 
     try:
         stats = run_crawl(
-            args.start_date, args.end_date, bodies=args.bodies, size=args.size
+            args.start_date, args.end_date, bodies=args.bodies, size=args.size,
+            config_file=args.config_file
         )
     except CrawlFailedError as exc:
         raise SystemExit(f"{label}: {exc}") from exc
@@ -135,9 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         "--fresh",
         action="store_true",
         help=(
-            "delete this range's records and objects before starting, so run 1 "
-            "has something to store. A test affordance only - the Landing Zone "
-            "is otherwise append-only, and nothing in the pipeline itself deletes."
+            "use new isolated collections and buckets for this check, keeping "
+            "all previously captured data intact"
         ),
     )
     args = parser.parse_args(argv)
@@ -150,15 +154,45 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2
 
+    if start > end:
+        print("start_date must be on or before end_date", file=sys.stderr)
+        return 2
+    if args.bodies and any(name.strip() not in settings.bodies for name in args.bodies.split(",")):
+        print("--bodies contains an unknown body", file=sys.stderr)
+        return 2
+    _failures.clear()
+    with tempfile.TemporaryDirectory(prefix="wrc-idempotency-") as directory:
+        if args.fresh:
+            settings = isolated_profile(settings, Path(directory))
+            print(f"Isolated landing collection: {settings.mongo.landing_collection}")
+            print(f"Isolated landing bucket: {settings.object_store.landing_bucket}")
+        args.config_file = settings.config_file
+        return verify(args, settings, start, end)
+
+
+def isolated_profile(settings: Settings, directory: Path) -> Settings:
+    """Create a fresh behavioral profile without altering the original stores."""
+    data = yaml.safe_load(settings.config_file.read_text(encoding="utf-8"))
+    tag = uuid.uuid4().hex
+    mongo = data["storage"]["mongo"]
+    mongo["landing_collection"] = f"wrc_check_{tag}_landing"
+    mongo["curated_collection"] = f"wrc_check_{tag}_curated"
+    mongo["state_collection"] = f"wrc_check_{tag}_state"
+    data["storage"]["object_store"].update(
+        landing_bucket=f"wrc-check-{tag}-landing",
+        curated_bucket=f"wrc-check-{tag}-curated",
+    )
+    path = directory / "settings.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return load_settings(path)
+
+
+def verify(args: argparse.Namespace, settings: Settings, start: date, end: date) -> int:
     body = args.bodies if args.bodies and "," not in args.bodies else None
 
     print("Idempotency check")
     print(f"  range   : {start.isoformat()} to {end.isoformat()}")
     print(f"  bodies  : {args.bodies or 'all'}")
-
-    if args.fresh:
-        removed = clear_range(settings, start, end, body)
-        print(f"  --fresh : removed {removed} existing records and their objects")
 
     before = snapshot(settings, start, end, body)
     print(f"  starting state: {before['count']} records already stored")
@@ -263,27 +297,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print("PASS - the second run stored nothing, changed nothing, and lost nothing.")
     return 0
-
-
-def clear_range(
-    settings: Settings, start: date, end: date, body: str | None
-) -> int:
-    """Remove one range's records and objects, so run 1 has work to do.
-
-    Scoped to the requested range and used only by --fresh. Nothing in the
-    pipeline itself deletes from the Landing Zone.
-    """
-    objects = ObjectStore.from_settings(settings)
-    bucket = settings.object_store.landing_bucket
-
-    with MetadataStore.from_settings(settings) as store:
-        collection = settings.mongo.landing_collection
-        records = list(store.find_by_range(collection, start, end, body=body))
-        for record in records:
-            if record.get("file_key"):
-                objects.delete_object(bucket, record["file_key"])
-            store.delete_by_id(collection, record["_id"])
-    return len(records)
 
 
 if __name__ == "__main__":

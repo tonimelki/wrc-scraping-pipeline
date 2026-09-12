@@ -50,6 +50,11 @@ class FakeStore:
         pass
 
 
+class ExistingObjectStore:
+    def exists(self, bucket, key):
+        return True
+
+
 @pytest.fixture
 def settings(monkeypatch):
     for key, value in REQUIRED_ENV.items():
@@ -165,10 +170,15 @@ def test_branch_counts_are_tracked_for_the_summary(spider):
 def test_attachment_is_requested_conditionally_when_an_etag_is_stored(settings):
     """A stored ETag means the server can answer 304 with no body at all."""
     url = "https://www.workplacerelations.ie/en/cases/x.html"
-    store = FakeStore({url: {"file_hash": "a" * 64, "http_etag": "635084655113670000"}})
+    store = FakeStore({url: {
+        "file_hash": "a" * 64, "http_etag": "635084655113670000",
+        "file_bucket": "landing", "file_key": "existing.pdf",
+        "download_url": "https://www.workplacerelations.ie/en/eat_import/2008/09/1020722f-dac0-45f8-91dc-f7482da0bb0b.pdf",
+    }})
     spider = WrcDecisionsSpider(
         start_date="2024-01-01", end_date="2024-01-31", bodies="labour_court",
         settings=settings, run_id="TEST-RUN", metadata_store=store,
+        object_store=ExistingObjectStore(),
     )
 
     request = list(spider.parse_detail(detail_response("detail_attachment.html", partial_item(url))))[0]
@@ -259,6 +269,11 @@ def test_304_marks_the_record_unmodified_with_no_body(spider):
     item = partial_item()
     item["branch"] = "attachment"
     response = _attachment_response(item, 304, b"", {})
+    response.meta["stored_record"] = {
+        "file_hash": "a" * 64, "file_bucket": "landing", "file_key": "existing.pdf",
+        "download_url": response.url,
+    }
+    spider._object_store = ExistingObjectStore()
 
     result = list(spider.parse_attachment(response))[0]
 

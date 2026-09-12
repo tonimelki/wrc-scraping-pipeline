@@ -6,16 +6,11 @@ with proper dependency handling**".
     landing_documents  ──>  curated_documents
       (scrape + store)        (clean + rename)
 
-Two assets, one dependency, both partitioned by month. Because they share a
-partitions definition, Dagster maps them partition-to-partition: materialising
-``curated_documents`` for 2024-02 depends on ``landing_documents`` for 2024-02,
-not on the whole landing table. That is what makes a backfill of one month a
-one-month job, and what makes a failed month retryable on its own.
-
-Why monthly matches the rest of the pipeline: the partition key *is* the
-``partition_date`` stamped on every record, so a Dagster partition and a
-pipeline partition are the same thing rather than two similar things that have
-to be kept in step.
+Two assets share the configured calendar periods and one dependency. Dagster
+maps them partition-to-partition, so each period can be backfilled or retried
+independently. Monthly is the default; all CLI partition sizes are supported.
+The partition key is the same calendar start as the ``partition_date`` stamped
+on records by the scraper.
 
 **The ingest asset shells out; the transform asset does not.** Scrapy runs on
 Twisted, whose reactor cannot be restarted in a process, so materialising two
@@ -31,28 +26,63 @@ plain synchronous code with no such constraint and runs in-process.
 # class and refuses to build the asset. Python 3.10+ supports the `X | None`
 # and `tuple[...]` syntax natively, so nothing here needs it anyway.
 
+import os
 from datetime import date, timedelta
 
 from dagster import (
     AssetExecutionContext,
     AssetKey,
     MetadataValue,
-    MonthlyPartitionsDefinition,
+    TimeWindowPartitionsDefinition,
     asset,
 )
 
+from wrc_pipeline.config import ConfigError
 from wrc_pipeline.orchestration.resources import (
     MongoResource,
     PipelineSettingsResource,
 )
+from wrc_pipeline.partitions import iter_partitions
 from wrc_pipeline.scraper.runner import run_crawl
 from wrc_pipeline.transform.job import transform_range
 
-# The window Dagster offers in its UI. Not the limit of what the pipeline can
-# scrape - the CLI takes any range, and the corpus reaches back to 1996 - but a
-# partition set spanning thirty years would be unusable to click through. Set
-# WRC_PARTITION_START to widen it for a historical backfill.
-monthly_partitions = MonthlyPartitionsDefinition(start_date="2024-01-01")
+
+def build_partitions_definition() -> TimeWindowPartitionsDefinition:
+    """Use the CLI profile and calendar boundaries for Dagster partitions.
+
+    WRC_PARTITION_START defaults to 2024-01-01. A date inside a period includes
+    that whole period, so historical backfills cannot silently skip its days.
+    Reload the Dagster code location after changing the profile or start date.
+    """
+    settings = PipelineSettingsResource().load()
+    raw_start = os.environ.get("WRC_PARTITION_START", "2024-01-01")
+    try:
+        start = date.fromisoformat(raw_start)
+        if start.isoformat() != raw_start:
+            raise ValueError
+    except ValueError:
+        raise ConfigError(
+            f"WRC_PARTITION_START must be an ISO date (YYYY-MM-DD), got {raw_start!r}"
+        ) from None
+
+    size = settings.partitioning.size
+    period_start = next(iter_partitions(start, start, size)).partition_date
+    schedules = {
+        "daily": "0 0 * * *",
+        "weekly": "0 0 * * 1",  # ISO weeks begin on Monday.
+        "monthly": "0 0 1 * *",
+        "quarterly": "0 0 1 1,4,7,10 *",
+        "yearly": "0 0 1 1 *",
+    }
+    return TimeWindowPartitionsDefinition(
+        start=period_start.isoformat(),
+        fmt="%Y-%m-%d",
+        timezone="UTC",
+        cron_schedule=schedules[size],
+    )
+
+
+pipeline_partitions = build_partitions_definition()
 
 
 def _partition_bounds(context: AssetExecutionContext) -> tuple[date, date]:
@@ -68,10 +98,10 @@ def _partition_bounds(context: AssetExecutionContext) -> tuple[date, date]:
 
 
 @asset(
-    partitions_def=monthly_partitions,
+    partitions_def=pipeline_partitions,
     group_name="landing",
     description=(
-        "Scrape one month of decisions from all four bodies into the Landing "
+        "Scrape one calendar partition of decisions from all four bodies into the Landing "
         "Zone: metadata into MongoDB, documents into object storage."
     ),
     kinds={"scrapy", "mongodb", "s3"},
@@ -80,7 +110,7 @@ def landing_documents(
     context: AssetExecutionContext,
     settings: PipelineSettingsResource,
 ) -> None:
-    """Ingest one monthly partition.
+    """Ingest one configured calendar partition.
 
     Runs the crawl in a subprocess - see ``scraper/runner.py`` for why - and
     surfaces the run's reconciliation as Dagster metadata, so the numbers that
@@ -93,7 +123,13 @@ def landing_documents(
     start, end = _partition_bounds(context)
     context.log.info(f"ingesting {start} to {end}")
 
-    stats = run_crawl(start, end)
+    loaded_settings = settings.load()
+    stats = run_crawl(
+        start,
+        end,
+        config_file=loaded_settings.config_file,
+        size=loaded_settings.partitioning.size,
+    )
 
     context.add_output_metadata(
         {
@@ -140,13 +176,13 @@ def landing_documents(
 
 
 @asset(
-    partitions_def=monthly_partitions,
+    partitions_def=pipeline_partitions,
     # The dependency edge. Same partitions definition on both sides, so Dagster
     # maps 2024-02 to 2024-02 rather than to the whole upstream asset.
     deps=[AssetKey("landing_documents")],
     group_name="curated",
     description=(
-        "Clean one month of Landing Zone documents into the Curated Zone: "
+        "Clean one calendar partition of Landing Zone documents into the Curated Zone: "
         "PDFs untouched, HTML reduced to the decision, files renamed to "
         "identifier.ext, written to a separate bucket and collection."
     ),
@@ -156,7 +192,7 @@ def curated_documents(
     context: AssetExecutionContext,
     settings: PipelineSettingsResource,
 ) -> None:
-    """Transform one monthly partition.
+    """Transform one configured calendar partition.
 
     Runs in-process: no reactor, no subprocess needed.
     """

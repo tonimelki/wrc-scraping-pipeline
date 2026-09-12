@@ -1,26 +1,9 @@
-"""Object storage key naming.
+"""Stable object names for immutable captures and curated documents.
 
-Where a document lives in the bucket is a policy decision, and it is kept out of
-``object_store.py`` on purpose: that module knows about buckets, keys and bytes,
-and nothing about decisions. Putting the naming here means the Landing Zone
-layout can change without touching the storage client, and the transform job
-can import the curated naming without importing anything from the scraper.
-
-**Landing keys mirror the source URL.**
-
-    https://www.workplacerelations.ie/en/cases/2024/february/adj-00045087.html
-    ->  workplace_relations/en/cases/2024/february/adj-00045087.html
-
-Three reasons. It is **unique** - the URL is what addresses the document, and
-the site's own reference numbers are not unique (``RPD241`` covers two different
-decisions). It is **traceable** - a reviewer clicking through the MinIO console
-can see exactly which page produced any object without consulting the database.
-And it is **stable** - the same document lands on the same key on every run,
-which is what makes re-running a partition overwrite nothing and duplicate
-nothing.
-
-The source name prefixes everything so that a second source added later
-occupies its own subtree rather than interleaving with this one.
+New landing objects use source/URL-hash/content-hash/filename. The full URL
+hash distinguishes hosts, query strings and sanitised filenames. Omitting the
+content hash retains the legacy naming helper for reading old captures.
+Curated objects use URL-hash/identifier.ext, independent of batch boundaries.
 """
 
 from __future__ import annotations
@@ -30,8 +13,7 @@ import re
 from urllib.parse import unquote, urlsplit
 
 # Characters S3 accepts in a key without needing escaping in URLs or tools.
-# Anything else is replaced rather than dropped, so two different source paths
-# can never collapse onto the same key.
+# The URL hash, not sanitisation, provides identity for new captures.
 _UNSAFE = re.compile(r"[^A-Za-z0-9!\-_.*'()/]")
 
 # Guards against a malformed URL producing a key that escapes its prefix.
@@ -42,7 +24,7 @@ class KeyError_(ValueError):
     """A URL that cannot be turned into a safe object key."""
 
 
-def landing_key(source: str, url: str) -> str:
+def landing_key(source: str, url: str, file_hash: str | None = None) -> str:
     """Object key for a document in the Landing Zone.
 
     Args:
@@ -51,7 +33,8 @@ def landing_key(source: str, url: str) -> str:
             branch, the attachment for the attachment branch.
 
     Returns:
-        ``{source}/{url path}``, percent-decoded and sanitised.
+        With file_hash: source/URL-hash/content-hash/filename. Without it:
+        the legacy source/URL-path key, percent-decoded and sanitised.
 
     Raises:
         KeyError_: if the URL has no usable path.
@@ -77,6 +60,15 @@ def landing_key(source: str, url: str) -> str:
     if not safe_path:
         raise KeyError_(f"URL path is empty after sanitising: {url!r}")
 
+    if file_hash:
+        import hashlib
+
+        if not re.fullmatch(r"[0-9a-f]{64}", file_hash):
+            raise KeyError_("a versioned landing key requires a SHA-256 hash")
+        # Include the complete URL: sanitisation, query strings and hosts must
+        # not collapse different documents onto one identity.
+        identity = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return f"{safe_source}/{identity}/{file_hash}/{safe_path.rsplit('/', 1)[-1]}"
     return f"{safe_source}/{safe_path}"
 
 
@@ -96,42 +88,11 @@ _FILENAME_SAFE = re.compile(r"[^A-Za-z0-9\-_.]")
 
 
 def curated_key(identifier: str, extension: str, discriminator: str | None = None) -> str:
-    """Object key for a document in the Curated Zone.
+    """Return identifier.ext inside a stable document directory when supplied.
 
-    The exercise: "Change the name of ALL the files to become identifier.ext
-    (from metadata)". So ``ADJ-00045087.html``, ``UD1066-2007.pdf``.
-
-    **The collision problem.** The site's reference numbers are not unique -
-    ``RPD241`` is both "LMK Detail Ltd -v- Kevin Cunningham" and "Bidvest
-    Noonan's -v- Aoife Core". Following the instruction literally would write
-    both to ``RPD241.html`` and destroy one, which is plainly not what the
-    requirement is *for*. So a colliding identifier gets a short deterministic
-    suffix derived from the document's source URL:
-
-        RPD241__1f4a9c2b.html
-        RPD241__7d3e0a15.html
-
-    Deterministic rather than a counter: a counter's value would depend on the
-    order documents happened to be processed in, so the same document could land
-    on a different name on the next run and the transform would stop being
-    idempotent. Derived from the URL, the name is a property of the document.
-
-    Non-colliding identifiers - the overwhelming majority - are untouched, so
-    the requirement holds literally for almost every file, and the exceptions
-    are logged and counted rather than silently lost.
-
-    **Sanitising.** Most identifiers are already filename-safe. A few are not:
-    ``IR - SC - 00001494`` contains spaces and an EN DASH. Those characters are
-    replaced, and the untouched identifier stays on the metadata record.
-
-    Args:
-        identifier: The record's reference from the source site.
-        extension: File extension including the dot, e.g. ``.pdf``.
-        discriminator: A stable per-document value (the detail URL) supplied
-            only when this identifier is known to cover more than one document.
-
-    Raises:
-        KeyError_: if the identifier is empty or sanitises away to nothing.
+    The pipeline always supplies the detail URL as discriminator. The filename
+    retains the reference number; two decisions sharing it occupy different
+    directories. Unsafe filename characters are replaced with underscores.
     """
     if not identifier or not identifier.strip():
         raise KeyError_("cannot build a curated key from an empty identifier")
@@ -145,10 +106,8 @@ def curated_key(identifier: str, extension: str, discriminator: str | None = Non
     if discriminator:
         import hashlib
 
-        # Eight hex characters: enough that an accidental second collision is
-        # not a practical concern, short enough that the name stays readable.
-        suffix = hashlib.sha256(discriminator.encode("utf-8")).hexdigest()[:8]
-        stem = f"{stem}__{suffix}"
+        directory = hashlib.sha256(discriminator.encode("utf-8")).hexdigest()
+        stem = f"{directory}/{stem}"
 
     if not extension.startswith("."):
         extension = f".{extension}"

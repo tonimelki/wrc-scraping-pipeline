@@ -16,12 +16,9 @@ page itself is a stub with an empty ``div.content``; otherwise the decision text
 is inline and the page *is* the document. The detail page is also the only place
 the document's own title appears.
 
-**The attachment**, when present, is fetched with ``If-None-Match`` if a
-previous run stored an ETag. Attachments serve one, so an unchanged document
-comes back as ``304`` with a zero-byte body and is never re-downloaded. Detail
-pages send ``Cache-Control: no-cache`` and no validator, so they cannot avoid
-the transfer - see ``pipelines/dedup.py`` for why re-fetching them is the right
-trade-off rather than assuming they are unchanged.
+Both document branches use HTTP validators when the server supplies them and
+the previous object still exists. Detail pages without validators must still
+be fetched to detect changes; binary attachments are always preserved verbatim.
 
 Storage, hashing and deduplication all happen in the item pipelines. The spider
 fetches and parses; it does not write.
@@ -37,7 +34,7 @@ from urllib.parse import urlencode, urlparse
 
 import scrapy
 from scrapy.downloadermiddlewares.retry import get_retry_request
-from scrapy.http import Response
+from scrapy.http import Response, TextResponse
 
 from wrc_pipeline.config import Settings, get_settings
 from wrc_pipeline.logging_setup import Event, bind_context, setup_logging
@@ -81,6 +78,7 @@ class WrcDecisionsSpider(scrapy.Spider):
         settings: Settings | None = None,
         run_id: str | None = None,
         metadata_store: Any = None,
+        object_store: Any = None,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -108,6 +106,7 @@ class WrcDecisionsSpider(scrapy.Spider):
         # Injected by the tests; opened lazily in a real run so that
         # constructing the spider does not require a database.
         self._metadata_store = metadata_store
+        self._object_store = object_store
 
         # Counters keyed by (partition_key, body). Per-slice rather than one
         # running total so the summary can name *which* slice came up short.
@@ -514,12 +513,7 @@ class WrcDecisionsSpider(scrapy.Spider):
 
             # Every "View Page" link ends in .html whatever the payload is, so
             # the page must be fetched before the branch can be decided.
-            yield scrapy.Request(
-                item["detail_url"],
-                callback=self.parse_detail,
-                meta={**response.meta, "item": item},
-                errback=self.handle_error,
-            )
+            yield self._request_detail(item, response.meta)
 
         yield from self._paginate(response, partition, body, page, total, len(rows))
 
@@ -613,6 +607,87 @@ class WrcDecisionsSpider(scrapy.Spider):
     # Layer 2: the detail page, where the branch is decided
     # ------------------------------------------------------------------
 
+    def _request_detail(self, item: DecisionItem, meta: dict[str, Any]) -> scrapy.Request:
+        stored = self._lookup_stored(item["detail_url"])
+        headers = (
+            self._conditional_headers(stored, item["detail_url"])
+            if stored.get("branch") == "html" else {}
+        )
+        return scrapy.Request(
+            item["detail_url"],
+            callback=self.parse_detail,
+            headers=headers,
+            meta={**meta, "item": item, "stored_record": stored, "handle_httpstatus_list": [304]},
+            errback=self.handle_error,
+        )
+
+    def _cached_object_exists(self, stored: dict[str, Any]) -> bool:
+        if not all(stored.get(field) for field in ("file_hash", "file_bucket", "file_key")):
+            return False
+        try:
+            if self._object_store is None:
+                from wrc_pipeline.storage.object_store import ObjectStore
+
+                self._object_store = ObjectStore.from_settings(self.settings_obj)
+            return self._object_store.exists(stored["file_bucket"], stored["file_key"])
+        except Exception as exc:  # noqa: BLE001 - unknown means download
+            self.logger.warning("could not check cached object; downloading", extra={"reason": str(exc)})
+            return False
+
+    def _conditional_headers(self, stored: dict[str, Any], url: str) -> dict[str, str]:
+        # A validator is scoped to its resource URL, not to the detail record.
+        if stored.get("download_url") != url:
+            return {}
+        headers = {}
+        if stored.get("http_etag"):
+            headers["If-None-Match"] = stored["http_etag"]
+        elif stored.get("http_last_modified"):
+            headers["If-Modified-Since"] = stored["http_last_modified"]
+        return headers if headers and self._cached_object_exists(stored) else {}
+
+    @staticmethod
+    def _carry_stored_location(item: DecisionItem, stored: dict[str, Any]) -> None:
+        item["stored_hash"] = stored.get("file_hash")
+        item["stored_file_key"] = stored.get("file_key")
+        item["stored_file_bucket"] = stored.get("file_bucket")
+
+    def _response_failure(self, response: Response, reason: str) -> None:
+        item = response.meta["item"]
+        self.note_failure(
+            identifier=item["identifier"], url=response.url, reason=reason,
+            partition_date=item.get("partition_date"), body=item.get("body"),
+            status_code=response.status,
+        )
+
+    def _not_modified(self, response: Response, stored: dict[str, Any]) -> Iterator[scrapy.Request | DecisionItem]:
+        item = response.meta["item"]
+        if stored.get("download_url") != response.url or not self._cached_object_exists(stored):
+            if response.meta.get("unconditional_refetch"):
+                self._response_failure(response, "304_without_cached_object")
+                return
+            headers = response.request.headers.copy()
+            headers.pop("If-None-Match", None)
+            headers.pop("If-Modified-Since", None)
+            yield response.request.replace(
+                headers=headers,
+                meta={**response.meta, "unconditional_refetch": True},
+                dont_filter=True,
+            )
+            return
+        self._carry_stored_location(item, stored)
+        for field in ("branch", "download_url", "file_size", "file_extension", "content_type",
+                      "http_etag", "http_last_modified"):
+            if field in stored:
+                item[field] = stored[field]
+        if not item.get("title"):
+            item["title"] = stored.get("title") or item["identifier"]
+        for field, header in (("http_etag", "ETag"), ("http_last_modified", "Last-Modified")):
+            if value := self._header(response, header):
+                item[field] = value
+        item["not_modified"] = True
+        item["payload"] = None
+        yield item
+
     def parse_detail(
         self, response: Response
     ) -> Iterator[scrapy.Request | DecisionItem]:
@@ -624,10 +699,23 @@ class WrcDecisionsSpider(scrapy.Spider):
             "identifier": item["identifier"],
         }
 
+        expected_path = urlparse(item["detail_url"]).path.rstrip("/").lower()
+        actual_path = urlparse(response.url).path.rstrip("/").lower()
+        if actual_path != expected_path:
+            self._response_failure(response, "redirected_off_detail_endpoint")
+            return
+        stored = response.meta.get("stored_record")
+        if stored is None:
+            stored = self._lookup_stored(item["detail_url"])
+        self._carry_stored_location(item, stored)
+        if response.status == 304:
+            yield from self._not_modified(response, stored)
+            self._branches["html"] += 1
+            return
+        if not isinstance(response, TextResponse):
+            self._response_failure(response, "detail_response_not_html")
+            return
         item["title"] = self._extract_title(response, item["identifier"])
-
-        stored = self._lookup_stored(item["detail_url"])
-        item["stored_hash"] = stored.get("file_hash")
 
         # The branch signal. `div.related-items a.download` is the specific
         # form; the looser selector is a fallback in case the wrapper markup
@@ -643,6 +731,15 @@ class WrcDecisionsSpider(scrapy.Spider):
             )
             return
 
+        selectors = self.settings_obj.source.content_selectors or ("div.content",)
+        has_content = any(
+            self._clean(" ".join(node.xpath(".//text()[not(ancestor::script) and not(ancestor::style)]").getall()))
+            for selector in selectors for node in response.css(selector)
+        )
+        if not has_content:
+            self._response_failure(response, "detail_content_missing")
+            return
+
         # Inline HTML: this page *is* the document. The exercise asks for the
         # whole page stored as .html; extracting only the decision text is the
         # transformation step's job, and doing it here would make the Landing
@@ -656,6 +753,7 @@ class WrcDecisionsSpider(scrapy.Spider):
         item["payload"] = self._normalise(response.body)
         item["content_type"] = self._content_type(response)
         item["http_etag"] = self._header(response, "ETag")
+        item["http_last_modified"] = self._header(response, "Last-Modified")
         self._branches["html"] += 1
 
         self.logger.debug(
@@ -682,14 +780,7 @@ class WrcDecisionsSpider(scrapy.Spider):
         item["download_url"] = response.urljoin(href)
         self._branches["attachment"] += 1
 
-        headers: dict[str, str] = {}
-        stored_etag = stored.get("http_etag")
-        if stored_etag and stored.get("file_hash"):
-            # Verified against the live site: a matching ETag returns 304 with a
-            # zero-byte body, and a stale one correctly returns 200 with the
-            # full document. Only sent when a hash is stored too, so a record
-            # with an ETag but no stored content still downloads.
-            headers["If-None-Match"] = stored_etag
+        headers = self._conditional_headers(stored, item["download_url"])
 
         self.logger.debug(
             "detail page carries an attachment",
@@ -712,6 +803,7 @@ class WrcDecisionsSpider(scrapy.Spider):
             meta={
                 **response.meta,
                 "item": item,
+                "stored_record": stored,
                 # Scrapy treats non-2xx as errors by default, which would send
                 # the 304 we are deliberately asking for to the errback.
                 "handle_httpstatus_list": [304],
@@ -723,7 +815,7 @@ class WrcDecisionsSpider(scrapy.Spider):
     # Layer 3: the attachment
     # ------------------------------------------------------------------
 
-    def parse_attachment(self, response: Response) -> Iterator[DecisionItem]:
+    def parse_attachment(self, response: Response) -> Iterator[scrapy.Request | DecisionItem]:
         """Attach the downloaded bytes, or note that nothing changed."""
         item: DecisionItem = response.meta["item"]
         context = {
@@ -733,30 +825,21 @@ class WrcDecisionsSpider(scrapy.Spider):
         }
 
         if response.status == 304:
-            # The server confirmed the stored copy is current and sent no body.
-            # This is the one path where "must not re-download unchanged files"
-            # is satisfied literally rather than approximately.
-            item["not_modified"] = True
-            item["payload"] = None
-            self.logger.debug(
-                "attachment unchanged; server returned 304",
-                extra={
-                    **context,
-                    "event": Event.DOWNLOAD_SUCCEEDED,
-                    "url": response.url,
-                    "bytes": 0,
-                    "reason": "not_modified",
-                },
-            )
-            yield item
+            yield from self._not_modified(response, response.meta.get("stored_record", {}))
             return
 
-        # Attachments are binary and carry no server-side templating, but the
-        # same normalisation is applied for consistency: one rule about what
-        # gets stored, not one rule per branch.
-        item["payload"] = self._normalise(response.body)
+        content_type = (self._content_type(response) or "").lower()
+        prefix = response.body[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+        if not response.body or "html" in content_type or re.search(
+            rb"<(?:!doctype\s+html|html|head|body)(?:\s|>)", prefix
+        ):
+            self._response_failure(response, "invalid_attachment_payload")
+            return
+        # Byte-for-byte preservation matters for PDF offsets and DOC streams.
+        item["payload"] = response.body
         item["content_type"] = self._content_type(response)
         item["http_etag"] = self._header(response, "ETag")
+        item["http_last_modified"] = self._header(response, "Last-Modified")
 
         self.logger.debug(
             "attachment downloaded",

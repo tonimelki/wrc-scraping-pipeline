@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from wrc_pipeline.storage.hashing import sha256_bytes
+from wrc_pipeline.storage.keys import curated_key, landing_key
 from wrc_pipeline.storage.mongo import MetadataStore
 from wrc_pipeline.storage.object_store import ObjectStore
 from wrc_pipeline.transform.job import transform_range
@@ -66,9 +67,9 @@ def zone(live_settings):
 
 def seed(settings, objects, *, identifier, url, payload, extension=".html"):
     """Put one document into the landing zone, as the scraper would have."""
-    key = f"workplace_relations/{url.split('://', 1)[1]}"
+    key = landing_key(settings.source.name, url, sha256_bytes(payload))
     objects.put_object(
-        settings.object_store.landing_bucket, key, payload, overwrite=True
+        settings.object_store.landing_bucket, key, payload
     )
     with MetadataStore.from_settings(settings) as store:
         store.upsert_metadata(
@@ -100,6 +101,56 @@ def run(settings):
     )
 
 
+def test_ingestion_keeps_metadata_captures_immutable(zone):
+    settings, _ = zone
+    collection = settings.mongo.landing_collection
+    document = {
+        "detail_url": "https://example.com/immutable", "identifier": "IMM-1",
+        "published_date": date(2024, 1, 15), "partition_date": date(2024, 1, 1),
+        "file_hash": sha256_bytes(b"first"),
+    }
+    with MetadataStore.from_settings(settings) as store:
+        store.upsert_metadata(collection, document)
+        original = list(store._db[collection].find({}))
+        store.upsert_metadata(collection, document)
+        assert list(store._db[collection].find({})) == original
+        store.upsert_metadata(collection, {**document, "file_hash": sha256_bytes(b"amended")})
+        assert store._db[collection].count_documents({}) == 2
+        assert store._db[collection].find_one({"_id": original[0]["_id"]}) == original[0]
+        assert store.find_by_id(collection, document["detail_url"])["file_hash"] == sha256_bytes(b"amended")
+        # A -> B -> A must select A again, without duplicating its capture.
+        store.upsert_metadata(collection, document)
+        assert store._db[collection].count_documents({}) == 2
+        assert store.find_by_id(collection, document["detail_url"])["file_hash"] == document["file_hash"]
+
+
+def test_transform_mid_month_uses_publication_date(zone):
+    settings, objects = zone
+    seed(settings, objects, identifier="MID", url="https://example.com/mid",
+         payload=b"%PDF-1.4\ncontent", extension=".pdf")
+    summary = transform_range(date(2024, 1, 15), date(2024, 1, 15), settings=settings)
+    assert summary.found == summary.written == 1
+
+
+def test_transform_same_identifier_in_separate_runs(zone):
+    settings, objects = zone
+    for day in (15, 16):
+        url = f"https://example.com/day-{day}"
+        seed(settings, objects, identifier="REUSED", url=url,
+             payload=f"%PDF-1.4 day {day}".encode(), extension=".pdf")
+        with MetadataStore.from_settings(settings) as store:
+            record = store.find_by_id(settings.mongo.landing_collection, url)
+            record["published_date"] = date(2024, 1, day)
+            store.upsert_metadata(settings.mongo.landing_collection, record)
+        result = transform_range(date(2024, 1, day), date(2024, 1, day), settings=settings)
+        assert result.written == 1 and result.failed == 0
+    keys = list(objects.list_keys(settings.object_store.curated_bucket))
+    assert len(keys) == 2
+    assert all(key.rsplit("/", 1)[-1] == "REUSED.pdf" for key in keys)
+    again = transform_range(date(2024, 1, 1), date(2024, 1, 31), settings=settings)
+    assert again.unchanged == 2 and again.written == 0
+
+
 # --------------------------------------------------------------------------
 # The exercise's six steps
 # --------------------------------------------------------------------------
@@ -120,7 +171,9 @@ def test_html_is_cleaned_and_renamed(zone):
     assert summary.cleaned == 1
     assert summary.reconciles
 
-    curated = objects.get_object(settings.object_store.curated_bucket, "ADJ-00045087.html")
+    curated = objects.get_object(settings.object_store.curated_bucket, curated_key(
+        "ADJ-00045087", ".html", "https://www.workplacerelations.ie/en/cases/2024/january/adj-00045087.html"
+    ))
     text = curated.decode("utf-8")
     assert "ADJUDICATION OFFICER DECISION" in text
     assert "Return to Search" not in text, "site furniture must not survive"
@@ -143,7 +196,9 @@ def test_pdfs_pass_through_byte_for_byte(zone):
 
     assert summary.passed_through == 1
     assert summary.cleaned == 0
-    stored = objects.get_object(settings.object_store.curated_bucket, "UD1066_2007.pdf")
+    stored = objects.get_object(settings.object_store.curated_bucket, curated_key(
+        "UD1066/2007", ".pdf", "https://www.workplacerelations.ie/en/cases/2008/september/ud1066_2007.html"
+    ))
     assert stored == payload
 
 
@@ -163,9 +218,9 @@ def test_the_curated_record_carries_the_new_path_and_hash(zone):
         record = store.find_by_id(settings.mongo.curated_collection, url)
 
     assert record["file_bucket"] == settings.object_store.curated_bucket
-    assert record["file_key"] == "ADJ-1.html"
+    assert record["file_key"] == curated_key("ADJ-1", ".html", url)
     # The hash describes the curated bytes, not the landing ones.
-    curated = objects.get_object(settings.object_store.curated_bucket, "ADJ-1.html")
+    curated = objects.get_object(settings.object_store.curated_bucket, curated_key("ADJ-1", ".html", url))
     assert record["file_hash"] == sha256_bytes(curated)
     assert record["file_hash"] != record["landing_hash"]
     # Lineage back to the raw capture.
@@ -226,7 +281,7 @@ def test_a_changed_landing_document_is_re_transformed(zone):
     second = run(settings)
 
     assert second.written == 1
-    curated = objects.get_object(settings.object_store.curated_bucket, "ADJ-1.html")
+    curated = objects.get_object(settings.object_store.curated_bucket, curated_key("ADJ-1", ".html", url))
     assert b"BBB" in curated and b"AAA" not in curated
 
 
@@ -256,7 +311,7 @@ def test_two_documents_sharing_a_reference_both_survive(zone):
     assert summary.renamed_with_discriminator == 2
     keys = sorted(objects.list_keys(settings.object_store.curated_bucket))
     assert len(keys) == 2, "both documents must survive"
-    assert all(k.startswith("RPD241__") for k in keys)
+    assert all(k.endswith("/RPD241.html") for k in keys)
 
 
 def test_collision_naming_is_stable_across_runs(zone):

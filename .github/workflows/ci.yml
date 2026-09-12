@@ -86,6 +86,8 @@ jobs:
       # the containers are unreachable, so a failure here means a real failure
       # rather than a missing service.
       - name: Test
+        env:
+          WRC_REQUIRE_INTEGRATION: "1"
         run: pytest -v
 
       - name: Stop containers

@@ -11,8 +11,8 @@ What it decides:
 * **unchanged** -> write nothing. This is what "must not create duplicates"
   means at the storage layer, and skipping the write is also what keeps the
   Landing Zone append-only in practice rather than only in principle.
-* **new or changed** -> write, refusing to overwrite unless the content
-  genuinely changed.
+* **new or changed** -> write an immutable content version. A matching
+  object left by a partial write is reused after verifying its hash.
 
 One deliberate extra round trip: an unchanged record still gets a ``HEAD`` to
 confirm the object is actually there. Mongo saying "we stored this" and the
@@ -30,6 +30,7 @@ from scrapy.exceptions import DropItem
 
 from wrc_pipeline.logging_setup import Event, get_logger
 from wrc_pipeline.scraper.pipelines.dedup import ContentState
+from wrc_pipeline.storage.hashing import sha256_bytes
 from wrc_pipeline.storage.keys import KeyError_, landing_key
 from wrc_pipeline.storage.object_store import ObjectStore, ObjectStoreError
 
@@ -62,97 +63,71 @@ class DocumentStoragePipeline:
         self.store.ensure_bucket(self.bucket)
 
     def process_item(self, item: Any, spider: Any) -> Any:
+        state = item.get("content_state")
+        unchanged = state in (ContentState.UNCHANGED, ContentState.NOT_MODIFIED)
+        bucket = (item.get("stored_file_bucket") or self.bucket) if unchanged else self.bucket
+        key = "<unresolved>"
         try:
-            key = landing_key(item["source"], item["download_url"])
-        except KeyError_ as exc:
+            # Preserve legacy locations for unchanged captures. Changed bytes
+            # always receive a new hash-versioned key, never an overwrite.
+            key = item.get("stored_file_key") if unchanged else None
+            key = key or landing_key(item["source"], item["download_url"], item["file_hash"])
+            item["file_bucket"] = bucket
+            item["file_key"] = key
+            item["file_extension"] = item.get("file_extension") or _extension_for(
+                item.get("content_type"), item["download_url"]
+            )
+
+            if self.store.exists(bucket, key):
+                if unchanged:
+                    return item
+                # A previous attempt may have uploaded the bytes then failed
+                # writing Mongo. Verify that object and finish the metadata.
+                if sha256_bytes(self.store.get_object(bucket, key)) != item["file_hash"]:
+                    raise ObjectStoreError("existing capture has different bytes; refusing to replace it")
+                return item
+
+            if not item.get("payload"):
+                raise ObjectStoreError("object_missing_and_not_refetched")
+            if unchanged:
+                item["content_state"] = ContentState.CHANGED
+
+            try:
+                stored = self.store.put_object(
+                    bucket, key, item["payload"],
+                    content_type=item.get("content_type"),
+                    metadata={
+                        "identifier": str(item.get("identifier", "")),
+                        "body": str(item.get("body", "")),
+                        "partition-date": str(item.get("partition_date", "")),
+                        "source-url": str(item["download_url"]),
+                    },
+                    overwrite=False,
+                )
+                item["file_size"] = stored.size
+            except ObjectStoreError:
+                # Another worker may have won the conditional S3 write.
+                # Only an identical object makes the failed write recoverable.
+                if not self.store.exists(bucket, key) or sha256_bytes(
+                    self.store.get_object(bucket, key)
+                ) != item["file_hash"]:
+                    raise
+            return item
+        except (ObjectStoreError, KeyError_) as exc:
             spider.note_failure(
                 identifier=item.get("identifier") or "<unknown>",
                 url=item.get("download_url") or "<unknown>",
-                reason=f"unusable_object_key:{exc}",
+                reason=f"object_store_failed:{exc}",
                 partition_date=item.get("partition_date"),
                 body=item.get("body"),
             )
-            raise DropItem(f"unusable object key: {exc}") from exc
-
-        item["file_bucket"] = self.bucket
-        item["file_key"] = key
-        item["file_extension"] = _extension_for(item.get("content_type"), item["download_url"])
-
-        state = item.get("content_state")
-
-        if state in (ContentState.UNCHANGED, ContentState.NOT_MODIFIED):
-            if self.store.exists(self.bucket, key):
-                return item
-            # Metadata and storage disagree. Re-store from the bytes we have,
-            # or - for a 304, where we deliberately have no bytes - report it
-            # rather than pretend the document is safely stored.
-            if not item.get("payload"):
-                spider.note_failure(
-                    identifier=item.get("identifier") or "<unknown>",
-                    url=item["download_url"],
-                    reason="object_missing_and_not_refetched",
-                    partition_date=item.get("partition_date"),
-                    body=item.get("body"),
-                )
-                raise DropItem(
-                    "object is missing from storage but the server returned 304, "
-                    "so there are no bytes to restore it from"
-                )
-            logger.warning(
-                "metadata says stored but the object is missing; re-storing",
-                extra={
-                    "event": Event.DOWNLOAD_STARTED,
-                    "identifier": item.get("identifier"),
-                    "bucket": self.bucket, "key": key,
-                    "partition_date": item.get("partition_date"),
-                    "body": item.get("body"),
-                    "reason": "object_missing_restoring",
-                },
+            logger.error(
+                "could not persist document capture",
+                extra={"event": Event.DOWNLOAD_FAILED, "url": item.get("download_url"),
+                       "bucket": bucket, "key": key, "reason": str(exc),
+                       "partition_date": item.get("partition_date"), "body": item.get("body")},
             )
-            item["content_state"] = ContentState.CHANGED
-
-        try:
-            stored = self.store.put_object(
-                self.bucket,
-                key,
-                item["payload"],
-                content_type=item.get("content_type"),
-                metadata={
-                    "identifier": str(item.get("identifier", "")),
-                    "body": str(item.get("body", "")),
-                    "partition-date": str(item.get("partition_date", "")),
-                    "source-url": str(item["download_url"]),
-                },
-                # Overwrite only when the content genuinely changed. A NEW
-                # record writing over something already there would mean two
-                # different documents claimed one key, which is a bug worth
-                # failing on rather than absorbing.
-                overwrite=item.get("content_state") == ContentState.CHANGED,
-            )
-        except ObjectStoreError as exc:
-            spider.note_failure(
-                identifier=item.get("identifier") or "<unknown>",
-                url=item["download_url"],
-                reason=f"object_store_write_failed:{type(exc).__name__}",
-                partition_date=item.get("partition_date"),
-                body=item.get("body"),
-            )
-            logger.exception(
-                "could not write document to object storage",
-                extra={
-                    "event": Event.DOWNLOAD_FAILED,
-                    "identifier": item.get("identifier"),
-                    "url": item["download_url"],
-                    "bucket": self.bucket, "key": key,
-                    "partition_date": item.get("partition_date"),
-                    "body": item.get("body"),
-                    "reason": "object_store_write_failed",
-                },
-            )
-            raise DropItem(f"object storage write failed: {exc}") from exc
-
-        item["file_size"] = stored.size
-        return item
+            raise DropItem(f"object storage failed: {exc}") from exc
 
 
 def _extension_for(content_type: str | None, url: str) -> str:

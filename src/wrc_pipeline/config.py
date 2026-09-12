@@ -155,6 +155,12 @@ class MongoSettings:
     database: str
     landing_collection: str
     curated_collection: str
+    state_collection: str | None = None
+
+    @property
+    def current_collection(self) -> str:
+        """Mutable crawl observations live outside the immutable landing data."""
+        return self.state_collection or f"{self.landing_collection}_state"
 
     @property
     def safe_uri(self) -> str:
@@ -437,7 +443,14 @@ def load_settings(
         curated_collection=_key(
             mongo_yaml, "storage.mongo", "curated_collection", errors, cast=str
         ),
+        state_collection=mongo_yaml.get("state_collection"),
     )
+    if mongo.state_collection is not None and (
+        not isinstance(mongo.state_collection, str) or not mongo.state_collection.strip()
+    ):
+        errors.append("storage.mongo.state_collection must be a non-empty string or null")
+    if mongo.current_collection in (mongo.landing_collection, mongo.curated_collection):
+        errors.append("storage.mongo.state_collection must differ from landing and curated collections")
     if (
         mongo.landing_collection
         and mongo.landing_collection == mongo.curated_collection

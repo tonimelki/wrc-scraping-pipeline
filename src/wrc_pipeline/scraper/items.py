@@ -28,7 +28,7 @@ import scrapy
 # `stored_hash`, `not_modified` and `content_state` are the deduplication
 # decision, which is about *this run* rather than about the document.
 TRANSIENT_FIELDS = frozenset(
-    {"payload", "stored_hash", "not_modified", "content_state"}
+    {"payload", "stored_hash", "stored_file_key", "stored_file_bucket", "not_modified", "content_state"}
 )
 
 
@@ -108,15 +108,18 @@ class DecisionItem(scrapy.Item):
     payload = scrapy.Field()
 
     # HTTP validator from the response, persisted so the *next* run can send
-    # If-None-Match and get a 304 back. Attachments serve an ETag; detail pages
-    # do not, which is why only half the corpus can avoid re-transfer.
+    # If-None-Match and get a 304 back. Last-Modified is the fallback when no
+    # ETag is supplied; both branches use whichever validator is available.
     http_etag = scrapy.Field()
+    http_last_modified = scrapy.Field()
 
     # Deduplication state, all transient:
     #   stored_hash    - what the database already had, for comparison
     #   not_modified   - the server answered 304 and sent no body
     #   content_state  - the conclusion: new / changed / unchanged / not_modified
     stored_hash = scrapy.Field()
+    stored_file_key = scrapy.Field()
+    stored_file_bucket = scrapy.Field()
     not_modified = scrapy.Field()
     content_state = scrapy.Field()
 

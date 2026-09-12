@@ -31,7 +31,7 @@ from wrc_pipeline.transform.job import transform_range
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("start_date", help="first partition date, ISO (YYYY-MM-DD)")
+    parser.add_argument("start_date", help="first publication date, ISO (YYYY-MM-DD)")
     parser.add_argument("end_date", help="last partition date, inclusive")
     parser.add_argument("--bodies", help="restrict to a single body name")
     parser.add_argument(
@@ -43,7 +43,11 @@ def main(argv: list[str] | None = None) -> int:
         settings = load_settings()
         start = parse_date(args.start_date, "start_date")
         end = parse_date(args.end_date, "end_date")
-    except (ConfigError, PartitionError) as exc:
+        if start > end:
+            raise ValueError("start_date must be on or before end_date")
+        if args.bodies is not None and args.bodies not in settings.bodies:
+            raise ValueError(f"unknown body: {args.bodies}")
+    except (ConfigError, PartitionError, ValueError) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2
 

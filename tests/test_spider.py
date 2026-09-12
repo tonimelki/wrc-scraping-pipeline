@@ -18,6 +18,7 @@ import pytest
 from scrapy.http import HtmlResponse, Request
 from scrapy.settings import Settings as ScrapySettings
 
+from tests.test_detail_branch import FakeStore
 from wrc_pipeline.config import DEFAULT_CONFIG_FILE, load_settings
 from wrc_pipeline.partitions import build_partitions
 from wrc_pipeline.scraper.spiders.wrc_decisions import WrcDecisionsSpider
@@ -70,6 +71,7 @@ def spider(settings):
         bodies="labour_court",
         settings=settings,
         run_id="TEST-RUN",
+        metadata_store=FakeStore(),
     )
 
 

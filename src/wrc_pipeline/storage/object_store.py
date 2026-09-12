@@ -8,8 +8,8 @@ sources" question, and it is demonstrably true rather than merely claimed.
 
 The Landing Zone is **immutable** per the exercise. That is enforced here rather
 than left to good intentions: ``put_object`` refuses to overwrite an existing
-key unless the caller passes ``overwrite=True``, which the landing path never
-does. The transform writes to a different bucket entirely.
+key unless the caller passes ``overwrite=True``. The landing pipeline always
+uses conditional creation, including for changed content under a new key. The transform writes to a different bucket entirely.
 
 Deliberately thin. It knows about buckets, keys and bytes; it knows nothing
 about decisions, partitions, or how a key is named. Key construction is a
@@ -194,6 +194,10 @@ class ObjectStore:
                 name: _ascii_safe(str(value)) for name, value in metadata.items()
             }
 
+        if not overwrite:
+            # Enforce immutability at S3 as well as in the preflight HEAD: two
+            # concurrent workers can both observe a missing key.
+            extra["IfNoneMatch"] = "*"
         try:
             self._client.put_object(Bucket=bucket, Key=key, Body=data, **extra)
         except (ClientError, BotoCoreError) as exc:

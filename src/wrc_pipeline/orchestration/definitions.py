@@ -28,7 +28,7 @@ from wrc_pipeline.orchestration.resources import (
 
 all_assets = load_assets_from_modules([assets])
 
-# Ingest then transform, for one month. Dagster orders the two from the
+# Ingest then transform, for one configured calendar period. Dagster orders the two from the
 # dependency declared on the asset, so the sequence is a property of the graph
 # rather than something restated here and able to drift from it.
 # The job's partitioning is inferred from the assets it selects - passing
@@ -37,7 +37,7 @@ ingest_and_transform = define_asset_job(
     name="ingest_and_transform",
     selection=AssetSelection.assets("landing_documents", "curated_documents"),
     description=(
-        "Scrape one month into the Landing Zone, then transform it into the "
+        "Scrape one calendar partition into the Landing Zone, then transform it into the "
         "Curated Zone. The transform runs only if the ingestion reconciled."
     ),
 )

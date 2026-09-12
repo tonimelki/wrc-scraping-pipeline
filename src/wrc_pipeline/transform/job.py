@@ -29,7 +29,6 @@ in-process and needs no subprocess.
 
 from __future__ import annotations
 
-import collections
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
@@ -96,7 +95,7 @@ def transform_range(
     """Transform every Landing Zone record in a date range.
 
     Args:
-        start_date: First partition date to include, inclusive.
+        start_date: First publication date to include, inclusive.
         end_date: Last, inclusive.
         body: Optional single body to restrict to.
         run_id: Ties this run's records back to its logs.
@@ -104,7 +103,11 @@ def transform_range(
     Returns:
         A summary whose ``reconciles`` property is the number to check first.
     """
+    if start_date > end_date:
+        raise ValueError("start_date must be on or before end_date")
     settings = settings or get_settings()
+    if body is not None and body not in settings.bodies:
+        raise ValueError(f"unknown body: {body}")
     summary = TransformSummary()
 
     objects = ObjectStore.from_settings(settings)
@@ -113,12 +116,10 @@ def transform_range(
     with MetadataStore.from_settings(settings) as store:
         store.ensure_indexes(settings.mongo.curated_collection)
 
-        records = list(
-            store.find_by_range(
-                settings.mongo.landing_collection, start_date, end_date, body=body
-            )
+        records = store.find_by_range(
+            settings.mongo.landing_collection, start_date, end_date,
+            body=body, field="published_date",
         )
-        summary.found = len(records)
 
         logger.info(
             "transform started",
@@ -127,38 +128,17 @@ def transform_range(
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
                 "body": body,
-                "records": summary.found,
                 "source_collection": settings.mongo.landing_collection,
                 "target_collection": settings.mongo.curated_collection,
                 "target_bucket": settings.object_store.curated_bucket,
             },
         )
 
-        # Which identifiers cover more than one document in this range?
-        #
-        # Resolved up front rather than on collision, so a document's curated
-        # name depends only on the document - not on the order records happened
-        # to be processed in, which would make the name change between runs.
-        colliding = {
-            identifier
-            for identifier, count in collections.Counter(
-                r.get("identifier") for r in records
-            ).items()
-            if identifier and count > 1
-        }
-        if colliding:
-            logger.warning(
-                "some reference numbers cover more than one document in this range",
-                extra={
-                    "event": Event.TRANSFORM_RECORD,
-                    "identifiers": sorted(colliding),
-                    "reason": "identifier_not_unique",
-                    "remedy": "these get a deterministic suffix derived from their URL",
-                },
-            )
-
+        # Stream records: naming depends on document identity, not on which
+        # other records happen to appear in this date range.
         for record in records:
-            _transform_one(record, colliding, settings, store, objects, run_id, summary)
+            summary.found += 1
+            _transform_one(record, settings, store, objects, run_id, summary)
 
     logger.info(
         "transform summary",
@@ -169,7 +149,6 @@ def transform_range(
 
 def _transform_one(
     record: dict[str, Any],
-    colliding: set[str],
     settings: Settings,
     store: MetadataStore,
     objects: ObjectStore,
@@ -195,7 +174,7 @@ def _transform_one(
                 raise ValueError("record has no file_key; nothing to transform")
 
             payload = objects.get_object(
-                settings.object_store.landing_bucket, landing_key
+                record.get("file_bucket") or settings.object_store.landing_bucket, landing_key
             )
 
             # --- 3. transform, or deliberately do not ---
@@ -235,10 +214,8 @@ def _transform_one(
                     )
 
             # --- 4. rename to identifier.ext ---
-            discriminator = record_id if identifier in colliding else None
-            if discriminator:
-                summary.renamed_with_discriminator += 1
-            key = curated_key(identifier, extension, discriminator)
+            key = curated_key(identifier, extension, record_id)
+            summary.renamed_with_discriminator += 1
 
             new_hash = sha256_bytes(curated_payload)
 
@@ -327,11 +304,8 @@ def _guard_key_collision(
 ) -> None:
     """Refuse to write if another record already owns this curated key.
 
-    The pre-pass catches identifiers that collide *within the requested range*.
-    Two documents sharing a reference across different ranges would slip past
-    it, and the failure mode is silent overwriting - one decision replacing
-    another. This is the backstop: it costs one indexed query and turns that
-    silent loss into a logged, counted failure.
+    Document directories prevent reference-number collisions. This indexed
+    check also catches inconsistent pre-existing metadata before any overwrite.
     """
     owner = store.find_one_by(
         settings.mongo.curated_collection, {"file_key": key}
@@ -339,9 +313,7 @@ def _guard_key_collision(
     if owner is not None and owner.get("_id") != record_id:
         raise ValueError(
             f"curated key {key!r} is already held by a different document "
-            f"({owner.get('_id')!r}). Two records share a reference number across "
-            f"date ranges; re-run the transform over a range containing both so "
-            f"the discriminator is applied to each."
+            f"({owner.get('_id')!r}); inspect the conflicting curated metadata."
         )
 
 

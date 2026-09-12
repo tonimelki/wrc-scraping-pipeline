@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 #   detail_url    - the record's identity; no key to deduplicate on
 #   identifier    - the site's reference; required metadata
 #   partition_date / body / source - provenance the exercise asks for
-REQUIRED_FIELDS = ("detail_url", "identifier", "partition_date", "body", "source")
+REQUIRED_FIELDS = ("detail_url", "identifier", "published_date", "partition_date", "body", "source")
 
 
 class ValidationPipeline:

@@ -123,6 +123,9 @@ storage:
     # writes to a separate collection, it never mutates this one.
     landing_collection: landing_decisions
     curated_collection: curated_decisions
+    # Mutable latest-record index, separate from immutable capture snapshots.
+    # null derives <landing_collection>_state; set a name to override it.
+    state_collection: null
   object_store:
     landing_bucket: wrc-landing
     curated_bucket: wrc-curated

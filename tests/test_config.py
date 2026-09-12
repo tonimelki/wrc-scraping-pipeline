@@ -116,6 +116,16 @@ def write_config(tmp_path: Path, overrides: dict | None = None) -> Path:
     return path
 
 
+@pytest.mark.parametrize("name", ["landing_decisions", "curated_decisions", "", 123])
+def test_current_state_cannot_alias_capture_or_curated_storage(tmp_path, env, name):
+    path = write_config(tmp_path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["storage"]["mongo"]["state_collection"] = name
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ConfigError, match="state_collection"):
+        load_settings(path, load_env=False)
+
+
 # --------------------------------------------------------------------------
 # The date format - the highest-value test in this file
 # --------------------------------------------------------------------------

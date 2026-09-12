@@ -52,11 +52,13 @@ def make_item(**overrides) -> DecisionItem:
         detail_url="https://www.workplacerelations.ie/en/cases/2024/january/adj-1.html",
         download_url="https://www.workplacerelations.ie/en/cases/2024/january/adj-1.html",
         partition_date=date(2024, 1, 1),
+        published_date=date(2024, 1, 15),
         body="labour_court",
         source="workplace_relations",
         payload=b"<html>a decision</html>",
         branch="html",
         content_type="text/html; charset=utf-8",
+        file_hash=sha256_bytes(b"<html>a decision</html>"),
     )
     for key, value in overrides.items():
         if value is None:
@@ -77,6 +79,13 @@ def test_valid_item_passes_through():
     item = make_item()
     assert ValidationPipeline().process_item(item, spider) is item
     assert spider.failures == []
+
+
+def test_missing_publication_date_is_logged_before_storage():
+    spider = FakeSpider()
+    with pytest.raises(DropItem, match="published_date"):
+        ValidationPipeline().process_item(make_item(published_date=None), spider)
+    assert len(spider.failures) == 1
 
 
 @pytest.mark.parametrize(
@@ -267,14 +276,14 @@ def test_unchanged_document_is_not_rewritten():
     """The point of deduplication: no second copy, no wasted write."""
     key = "workplace_relations/en/cases/2024/january/adj-1.html"
     store = FakeObjectStore(existing={key})
-    item = make_item(content_state=ContentState.UNCHANGED)
+    item = make_item(content_state=ContentState.UNCHANGED, stored_file_key=key)
 
     storage_pipeline(store).process_item(item, FakeSpider())
 
     assert store.writes == []
 
 
-def test_changed_document_overwrites():
+def test_changed_document_uses_a_new_version_without_overwriting():
     key = "workplace_relations/en/cases/2024/january/adj-1.html"
     store = FakeObjectStore(existing={key})
     item = make_item(content_state=ContentState.CHANGED)
@@ -282,7 +291,8 @@ def test_changed_document_overwrites():
     storage_pipeline(store).process_item(item, FakeSpider())
 
     assert len(store.writes) == 1
-    assert store.writes[0][3] is True, "overwrite must be explicit"
+    assert store.writes[0][3] is False
+    assert store.writes[0][1] != key
 
 
 def test_new_document_never_overwrites():
@@ -316,7 +326,7 @@ def test_missing_object_after_a_304_is_reported_not_faked():
     with pytest.raises(DropItem):
         storage_pipeline(store).process_item(item, spider)
 
-    assert spider.failures[0]["reason"] == "object_missing_and_not_refetched"
+    assert "object_missing_and_not_refetched" in spider.failures[0]["reason"]
 
 
 def test_a_write_failure_is_counted_as_a_failure():
@@ -326,7 +336,7 @@ def test_a_write_failure_is_counted_as_a_failure():
     with pytest.raises(DropItem):
         storage_pipeline(store).process_item(make_item(content_state=ContentState.NEW), spider)
 
-    assert "object_store_write_failed" in spider.failures[0]["reason"]
+    assert "object_store_failed" in spider.failures[0]["reason"]
 
 
 # ==========================================================================
@@ -455,7 +465,7 @@ def test_colliding_identifiers_get_distinct_deterministic_names():
     b = curated_key("RPD241", ".html", "https://x.ie/en/cases/2024/february/rpd241.html")
 
     assert a != b
-    assert a.startswith("RPD241__") and b.startswith("RPD241__")
+    assert a.endswith("/RPD241.html") and b.endswith("/RPD241.html")
     assert a.endswith(".html")
 
 

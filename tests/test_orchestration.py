@@ -13,7 +13,7 @@ of every single month.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -21,9 +21,10 @@ from wrc_pipeline.orchestration.assets import (
     _partition_bounds,
     curated_documents,
     landing_documents,
-    monthly_partitions,
+    pipeline_partitions,
 )
 from wrc_pipeline.orchestration.definitions import defs
+from wrc_pipeline.orchestration.resources import PipelineSettingsResource
 
 
 class FakeWindow:
@@ -123,8 +124,8 @@ def test_both_assets_share_one_partitions_definition():
     With different definitions the transform would depend on the *entire*
     landing asset, so one month's backfill would wait on all of them.
     """
-    assert landing_documents.partitions_def is monthly_partitions
-    assert curated_documents.partitions_def is monthly_partitions
+    assert landing_documents.partitions_def is pipeline_partitions
+    assert curated_documents.partitions_def is pipeline_partitions
 
 
 def test_partitions_are_monthly_and_match_the_pipeline_default():
@@ -133,7 +134,7 @@ def test_partitions_are_monthly_and_match_the_pipeline_default():
     If these disagreed, a Dagster partition and a pipeline partition would be
     two similar things needing to be kept in step by hand.
     """
-    keys = monthly_partitions.get_partition_keys()
+    keys = pipeline_partitions.get_partition_keys()
 
     assert "2024-01-01" in keys
     assert "2024-02-01" in keys
@@ -288,7 +289,7 @@ def test_a_partition_that_was_never_searched_fails(monkeypatch):
     context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
 
     with pytest.raises(RuntimeError, match="not fully searched"):
-        _landing_fn()(context, settings=None)
+        _landing_fn()(context, settings=PipelineSettingsResource())
 
 
 def test_an_empty_but_searched_partition_succeeds(monkeypatch):
@@ -299,7 +300,7 @@ def test_an_empty_but_searched_partition_succeeds(monkeypatch):
     monkeypatch.setattr(assets_module, "run_crawl", lambda *a, **k: empty)
 
     context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
-    _landing_fn()(context, settings=None)
+    _landing_fn()(context, settings=PipelineSettingsResource())
 
     assert context.metadata["found"] == 0
     assert context.metadata["crawl_complete"] is True
@@ -315,7 +316,7 @@ def test_a_mismatched_partition_still_fails(monkeypatch):
     context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
 
     with pytest.raises(RuntimeError, match="did not reconcile"):
-        _landing_fn()(context, settings=None)
+        _landing_fn()(context, settings=PipelineSettingsResource())
 
 
 def test_completeness_is_reported_as_metadata(monkeypatch):
@@ -325,8 +326,81 @@ def test_completeness_is_reported_as_metadata(monkeypatch):
     monkeypatch.setattr(assets_module, "run_crawl", lambda *a, **k: _stats())
 
     context = RecordingContext(date(2024, 1, 1), date(2024, 2, 1))
-    _landing_fn()(context, settings=None)
+    _landing_fn()(context, settings=PipelineSettingsResource())
 
     assert context.metadata["crawl_units"] == 4
     assert context.metadata["units_resolved"] == 4
     assert context.metadata["crawl_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("size", "expected_start", "expected_end"),
+    [
+        ("daily", date(2024, 2, 29), date(2024, 2, 29)),
+        ("weekly", date(2024, 2, 26), date(2024, 3, 3)),
+        ("monthly", date(2024, 2, 1), date(2024, 2, 29)),
+        ("quarterly", date(2024, 1, 1), date(2024, 3, 31)),
+        ("yearly", date(2024, 1, 1), date(2024, 12, 31)),
+    ],
+)
+def test_configured_partitions_cover_the_requested_calendar_period(
+    size, expected_start, expected_end, monkeypatch, tmp_path
+):
+    import wrc_pipeline.orchestration.assets as assets_module
+
+    profile = _partition_profile(tmp_path, size)
+    monkeypatch.setenv("WRC_CONFIG_FILE", str(profile))
+    monkeypatch.setenv("WRC_PARTITION_START", "2024-02-29")
+
+    partitions = assets_module.build_partitions_definition()
+    first_key = partitions.get_partition_keys(
+        current_time=datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )[0]
+    assert first_key == expected_start.isoformat()
+    window = partitions.time_window_for_partition_key(first_key)
+    assert _partition_bounds(FakeContext(window.start.date(), window.end.date())) == (
+        expected_start, expected_end
+    )
+
+
+@pytest.mark.parametrize("start", ["invalid", "2024-02-30", "20240201", ""])
+def test_invalid_partition_start_fails_clearly(start, monkeypatch):
+    import wrc_pipeline.orchestration.assets as assets_module
+    from wrc_pipeline.config import ConfigError
+
+    monkeypatch.setenv("WRC_PARTITION_START", start)
+    with pytest.raises(ConfigError, match="WRC_PARTITION_START.*YYYY-MM-DD"):
+        assets_module.build_partitions_definition()
+
+
+def _partition_profile(tmp_path, size):
+    import yaml
+
+    from wrc_pipeline.config import DEFAULT_CONFIG_FILE
+
+    data = yaml.safe_load(DEFAULT_CONFIG_FILE.read_text(encoding="utf-8"))
+    data["partitioning"]["size"] = size
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return profile
+
+
+def test_ingestion_forwards_the_resource_profile_and_partition_size(tmp_path, monkeypatch):
+    import wrc_pipeline.orchestration.assets as assets_module
+    from wrc_pipeline.orchestration.resources import PipelineSettingsResource
+
+    profile = _partition_profile(tmp_path, "weekly")
+    calls = []
+
+    def capture_crawl(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _stats()
+
+    # The subprocess boundary is replaced so this wiring test cannot crawl.
+    monkeypatch.setattr(assets_module, "run_crawl", capture_crawl)
+    context = RecordingContext(date(2024, 2, 26), date(2024, 3, 4), "2024-02-26")
+    _landing_fn()(context, settings=PipelineSettingsResource(config_file=str(profile)))
+
+    assert calls == [
+        ((date(2024, 2, 26), date(2024, 3, 3)), {"config_file": profile, "size": "weekly"})
+    ]

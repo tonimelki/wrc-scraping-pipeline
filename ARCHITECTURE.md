@@ -1,73 +1,60 @@
 # Architecture
 
-### Why monthly partitions
+## Partitions and orchestration
 
-A month of the busiest body is ~280 records — about 28 listing pages at the
-site's fixed 10 per page. Small enough that a failed partition is cheap to
-retry, large enough that Scrapy's per-process startup stays amortised.
+Monthly partitions balance process startup cost and retry granularity. The
+original busiest-body sample was about 280 records per month. Daily, weekly,
+quarterly and yearly periods are configurable; Dagster uses the same calendar
+boundaries. Each record carries the calendar start as `partition_date`, while
+transformation selects inclusive publication dates, including partial months.
+Dagster runs ingestion before transformation. Scrapy runs in a subprocess
+because Twisted's reactor cannot be restarted; transformation streams records
+in-process.
 
-The choice matters less than it looks: a listing page yields 10 records whatever
-range it covers, so listing pages scale with record count, not partition size.
-What size actually buys is **retry granularity**. Daily would multiply Scrapy
-startups thirtyfold for the same data; yearly puts 2,700+ records behind one
-unit of work. Configurable `daily`…`yearly`; the partition key is both the
-record's `partition_date` and the Dagster partition key, so they cannot drift.
+## Retries and rate limiting
 
-### Retries and rate limiting
+Scrapy retries configured transient HTTP failures, with three retries by
+default. AutoThrottle adjusts delay to measured latency; a minimum delay and
+per-domain concurrency limit bound load. The historical sweep selected target
+concurrency 2: target 4 gave no throughput improvement, while target 8 saved
+about five seconds on the sample at greater load. Measurements and reproduction
+commands are in the README.
 
-Scrapy's `RetryMiddleware`, 3 attempts, on 429/408/5xx. An exhausted retry
-reaches the spider's errback, is logged with URL and status, and is counted
-against the site's own result count — so it surfaces as a number, not a gap.
+Search redirects to error pages consume the retry budget. Detail responses
+must remain on the expected path and contain document content or an attachment;
+HTML error responses cannot become binary documents. Failed records include
+URLs and reasons in JSON logs. Reconciliation and search coverage are checked
+separately so an aborted zero-record crawl cannot look successful.
 
-**One failure is not an error code at all.** Under load the search endpoint
-`302`s to an error page, which returns `200` with no results — indistinguishable
-from an empty month, and empty months are most of this corpus. The spider
-therefore checks the response is still on the search path, retries the original
-URL on the same budget, and fails the slice rather than recording it as empty.
-Detail in the README.
+## Identity, deduplication and preservation
 
-**AutoThrottle is the control, not a fixed delay**: a constant sleep answers
-"don't get blocked" but not "be fast". It measures real latency and converges on
-the concurrency the server tolerates; `DOWNLOAD_DELAY` is a floor beneath it.
+`detail_url` identifies a decision because reference numbers repeat. HTML
+normalization removes configured volatile comments before SHA-256 hashing;
+binary attachments are stored byte-for-byte. Available ETag/Last-Modified
+validators avoid unchanged transfers, but sources without validators require
+a fetch to detect amendments. A missing cached object triggers a full fetch.
 
-Target concurrency **2** was measured, not guessed. Throughput plateaus there —
-2 and 4 are identical at ~158 req/min — and the faster setting above the plateau
-saves about a minute across the evaluation corpus, which is not worth
-quadrupling load on a small public service. Sweep table in the README.
+Landing objects use `source/URL-hash/content-hash/filename` and conditional
+creation. Metadata snapshots are insert-only, keyed by a deterministic digest
+excluding run bookkeeping. A separate configurable state collection tracks the
+latest capture and observation times. This preserves prior captures while
+supporting amendments and content reversions. Object upload precedes snapshot
+insertion, which precedes current-state update; a retry reuses verified objects
+and existing snapshots after a partial failure. Legacy captures remain readable
+without destructive migration.
 
-### Deduplication
+Curated files use `URL-hash/identifier.ext`. The directory depends only on the
+document, so duplicate identifiers work across independent batches. Curated
+metadata records the new hash and path plus landing lineage. Transformation
+never writes to the landing stores.
 
-**The identity is `detail_url`, not `identifier`.** The site's reference numbers
-are not unique — Q1 2024 gave 895 records under 893 identifiers, because
-`RPD241` is two different decisions. Keying on it would have destroyed one of
-each pair *while found-vs-scraped reconciled perfectly*, since both really were
-scraped. `identifier` stays indexed.
+## At 50+ sources
 
-Records upsert on that key with three outcomes — `inserted`, `updated`,
-`unchanged` — because "wrote a record" and "record was already correct" are the
-difference between working and *idempotent*. Change is SHA-256 of the stored
-bytes, taken **after** per-request noise is stripped: every page embeds the
-server's render time in an HTML comment, so an unchanged page otherwise hashes
-differently on every fetch and the whole corpus re-stores itself every run.
-
-Re-downloading is avoided where the server allows. Attachments serve an `ETag`,
-so `If-None-Match` returns `304` with zero bytes. Detail pages offer no
-validator and are re-fetched — assuming an already-seen page is unchanged would
-be wrong for a corpus where decisions get amended after publication.
-
-### What would change for 50+ sources
-
-Partitioning, storage, hashing, key naming, logging, reconciliation and
-orchestration are already source-agnostic, and everything site-specific lives in
-`settings.yaml` — URL parameters, date format, body IDs, volatile patterns,
-content selectors. Three things need real work: **a source interface** (one
-spider per source against a common contract, with partition → pages → detail →
-branch → store lifted into a base); **per-source operational config**, since
-rate limits, schedules and robots policy differ per site; and **concurrency** —
-the spider's stored-record lookup is a blocking driver call inside Twisted's
-reactor, fine against local Mongo, not at 50x against a remote one.
-
-The bottleneck isn't the crawler. 79 KB of listing is fetched per record against
-24 KB of document — **3.2x more bandwidth spent finding records than fetching
-them** — and it isn't tunable, because page size is fixed at 10. At scale the
-fix is a bulk export or an API, not a cleverer crawl.
+Introduce a common source contract and per-source configuration for parsing,
+rate limits, robots policy and schedules. Move blocking database/object-store
+calls off Scrapy's reactor, bound concurrent work across workers, and add
+retention rules for capture history. Keep the current-state lookup and source
+identity isolated per source. Large backfills should use available bulk exports
+or APIs: the original sample spent more bandwidth on listings than documents.
+The present design streams transforms and indexes date/body queries, but does
+not claim a benchmark at a million records.

@@ -1,36 +1,19 @@
-"""MongoDB metadata store for the Landing and Curated zones.
+"""MongoDB capture history and current-record lookup.
 
-This module owns the exercise's idempotency requirement: "running it twice on
-the same date range must not create duplicate records". That reduces to one
-decision - **what identifies a record** - and one operation: upsert on it.
+Landing writes insert immutable metadata snapshots, deduplicated by a digest
+of content and metadata. A separate configurable state collection tracks the
+latest snapshot and first/last observation per detail URL. Curated metadata
+is mutable and rebuildable. Existing URL-keyed landing records remain readable
+without migration or modification.
 
-**The identity is ``detail_url``, not ``identifier``.**
-
-The obvious choice is the site's own reference number, and the project brief
-originally said to use it. Scraping Q1 2024 disproved that: 895 records carried
-only 893 distinct identifiers. ``RPD241`` is *both* "LMK Detail Ltd -v- Kevin
-Cunningham" (/2024/july/rpd241.html) and "Bidvest Noonan's -v- Aoife Core"
-(/2024/february/rpd241.html) - two different decisions, one reference number.
-``ADJ-00044064`` behaves the same way.
-
-Keying on ``identifier`` would have silently overwritten one document of each
-pair. Worse, it would have done so *while the run's found-vs-scraped totals
-reconciled perfectly*, because both records really were scraped - the loss
-would have been invisible in exactly the accounting built to catch it.
-
-``detail_url`` is what actually addresses a document, is distinct for the
-colliding pairs, and is stable across runs - so a re-run of the same range
-still upserts rather than duplicating, which is what the exercise asks for.
-``identifier`` remains an indexed field for lookup; it is metadata, not a key.
-
-**Immutability.** The exercise says not to delete or update Landing Zone data.
-Upserting is not in tension with that: ``first_seen_at`` is written once and
-never touched again, the curated layer is a separate collection, and nothing
-here deletes.
+find_by_id/find_by_range/count on the landing collection expose the current
+logical corpus; querying the landing collection directly exposes its history.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date, datetime, time, timezone
 from enum import Enum
 from typing import Any, Iterator, Mapping
@@ -104,6 +87,8 @@ class MetadataStore:
         "1000x that" it asks us to design for, it is the difference between a
         job that finishes and one that does not.
         """
+        if collection == self.settings.landing_collection:
+            self.ensure_indexes(self.settings.current_collection)
         try:
             return self._db[collection].create_indexes(
                 [
@@ -158,7 +143,7 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def upsert_metadata(
-        self, collection: str, document: Mapping[str, Any]
+        self, collection: str, document: Mapping[str, Any], *, _first_seen: datetime | None = None
     ) -> UpsertResult:
         """Insert or update one record, keyed on ``detail_url``.
 
@@ -171,6 +156,8 @@ class MetadataStore:
             MetadataStoreError: on failure, or if the document has no
                 ``detail_url`` to key on.
         """
+        if collection == self.settings.landing_collection:
+            return self._capture_landing(document)
         document = dict(document)
         key = document.get("detail_url")
         if not key:
@@ -216,8 +203,11 @@ class MetadataStore:
             },
             # Written on insert and never again: the Landing Zone records when
             # it first saw a document, and that fact is not revised.
-            "$setOnInsert": {"first_seen_at": now},
+            "$setOnInsert": {"first_seen_at": _first_seen or now},
         }
+        removed = set(existing or {}) - set(document) - _VOLATILE_FIELDS
+        if removed:
+            update["$unset"] = dict.fromkeys(removed, "")
         try:
             result = self._db[collection].update_one(
                 {"_id": key}, update, upsert=True
@@ -227,6 +217,46 @@ class MetadataStore:
 
         return UpsertResult.INSERTED if result.upserted_id else UpsertResult.UPDATED
 
+    def _capture_landing(self, document: Mapping[str, Any]) -> UpsertResult:
+        """Insert an immutable snapshot before updating the separate current index.
+
+        Snapshot IDs describe content and metadata, excluding run bookkeeping.
+        A failed index write can be retried safely; A -> B -> A reuses capture A
+        while moving the current index back to it. Legacy URL-keyed captures
+        are left in place and remain readable until revisited.
+        """
+        incoming = {k: v for k, v in document.items()
+                    if k not in _STORE_MANAGED_FIELDS and k != "landing_snapshot_id"}
+        key = incoming.get("detail_url")
+        if not key:
+            raise MetadataStoreError("document has no 'detail_url' to key on")
+        for field in ("partition_date", "published_date"):
+            if isinstance(incoming.get(field), date):
+                incoming[field] = _to_datetime(incoming[field])
+        existing = self.find_by_id(self.settings.landing_collection, key)
+        canonical = {k: v for k, v in incoming.items() if k not in _VOLATILE_FIELDS}
+        digest = hashlib.sha256(json.dumps(
+            canonical, sort_keys=True, ensure_ascii=True, default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        snapshot_id = f"{key}#{digest}"
+        now = datetime.now(timezone.utc)
+        snapshot = {**incoming, "_id": snapshot_id, "first_seen_at": now}
+        try:
+            self._db[self.settings.landing_collection].update_one(
+                {"_id": snapshot_id}, {"$setOnInsert": snapshot}, upsert=True
+            )
+        except PyMongoError as exc:
+            raise MetadataStoreError(f"could not capture {key!r}: {exc}") from exc
+        self.upsert_metadata(
+            self.settings.current_collection,
+            {**incoming, "landing_snapshot_id": snapshot_id},
+            _first_seen=(existing or {}).get("first_seen_at"),
+        )
+        if existing is None:
+            return UpsertResult.INSERTED
+        return UpsertResult.UNCHANGED if _same_content(existing, incoming) else UpsertResult.UPDATED
+
     # ------------------------------------------------------------------
     # Reading
     # ------------------------------------------------------------------
@@ -234,6 +264,10 @@ class MetadataStore:
     def find_by_id(self, collection: str, detail_url: str) -> dict[str, Any] | None:
         """One record by its identity, or None."""
         try:
+            if collection == self.settings.landing_collection:
+                current = self._db[self.settings.current_collection].find_one({"_id": detail_url})
+                if current is not None:
+                    return current
             return self._db[collection].find_one({"_id": detail_url})
         except PyMongoError as exc:
             raise MetadataStoreError(f"could not read {detail_url!r}: {exc}") from exc
@@ -259,6 +293,8 @@ class MetadataStore:
         whole document back: has this document's content changed since we last
         stored it?
         """
+        if collection == self.settings.landing_collection:
+            return (self.find_by_id(collection, detail_url) or {}).get("file_hash")
         try:
             found = self._db[collection].find_one(
                 {"_id": detail_url}, {"file_hash": 1}
@@ -300,6 +336,9 @@ class MetadataStore:
             query["body"] = body
 
         try:
+            if collection == self.settings.landing_collection:
+                yield from self._current_records(query, field)
+                return
             # Sorted so a run's output order is reproducible, which makes two
             # runs' logs diffable.
             yield from self._db[collection].find(query).sort(
@@ -311,22 +350,31 @@ class MetadataStore:
     def count(self, collection: str, query: Mapping[str, Any] | None = None) -> int:
         """How many records match."""
         try:
+            if collection == self.settings.landing_collection:
+                return sum(1 for _ in self._current_records(dict(query or {})))
             return self._db[collection].count_documents(dict(query or {}))
         except PyMongoError as exc:
             raise MetadataStoreError(f"could not count {collection!r}: {exc}") from exc
 
+    def _current_records(self, query: dict[str, Any], field: str = "_id") -> Iterator[dict[str, Any]]:
+        """Stream current observations, plus untouched pre-versioning records.
+
+        New snapshots are never mixed into this logical one-record-per-URL view.
+        The legacy fallback is read-only; an existing current record wins even
+        if its amended publication date has moved outside the requested range.
+        """
+        state = self._db[self.settings.current_collection]
+        yield from state.find(query).sort([(field, ASCENDING)])
+        legacy_query = {"$and": [query, {"$expr": {"$eq": ["$_id", "$detail_url"]}}]}
+        for record in self._db[self.settings.landing_collection].find(legacy_query).sort([(field, ASCENDING)]):
+            if state.find_one({"_id": record["_id"]}) is None:
+                yield record
+
     def delete_by_id(self, collection: str, detail_url: str) -> bool:
         """Delete one record. Returns True if something was removed.
 
-        **Nothing in the pipeline calls this.** The exercise requires the
-        Landing Zone to be append-only, and it is: the spider and its item
-        pipelines only ever insert or upsert.
-
-        It exists so that scripts which need to reset a scoped slice of state -
-        `check_idempotency.py --fresh`, and the integration tests - can do so
-        through a documented method rather than reaching into the driver
-        handle. A caller poking at `store._db` would be both fragile and a
-        much easier thing to do by accident.
+        Only test helpers use this method. The pipeline never deletes captures;
+        the idempotency check's --fresh option uses isolated storage instead.
         """
         try:
             return self._db[collection].delete_one({"_id": detail_url}).deleted_count > 0
@@ -336,6 +384,8 @@ class MetadataStore:
     def drop_collection(self, collection: str) -> None:
         """Drop a collection. Tests and scripts only - never the Landing Zone."""
         self._db[collection].drop()
+        if collection == self.settings.landing_collection:
+            self._db[self.settings.current_collection].drop()
 
 
 # --------------------------------------------------------------------------
@@ -360,6 +410,7 @@ _VOLATILE_FIELDS = frozenset(
         # This store's own.
         "first_seen_at",
         "last_seen_at",
+        "landing_snapshot_id",
     }
 )
 

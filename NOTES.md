@@ -1,3 +1,6 @@
+> Historical build notes: these record earlier implementation decisions and measurements.
+> The current storage/versioning contract and commands are in README.md and ARCHITECTURE.md.
+
 # Reconnaissance & build notes
 
 Working notes kept while building this pipeline: the exercise's requirements in

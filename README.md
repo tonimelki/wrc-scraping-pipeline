@@ -1,424 +1,219 @@
 # WRC Scraping Pipeline
 
-A Scrapy pipeline that harvests decisions and determinations from
-[Ireland's Workplace Relations Commission](https://www.workplacerelations.ie)
-into a Landing Zone (MongoDB + MinIO), then transforms them into a curated
-layer. Orchestrated with Dagster; also runnable from the command line.
+Scrapy pipeline for Ireland's Workplace Relations Commission decisions database.
+MongoDB stores metadata; MinIO stores documents. Dagster runs ingestion and
+transformation as separate tasks with a dependency between them.
 
-Design decisions and the evidence behind them are in
-**[ARCHITECTURE.md](ARCHITECTURE.md)**.
-
----
-
-## Prerequisites
-
-| | Version used | Notes |
-|---|---|---|
-| Docker Desktop | 28.x | Must be running before `docker compose up`. |
-| Python | 3.13 | `>=3.11,<3.14` — Scrapy's supported matrix tops out at 3.13. |
-
-Developed on Windows 11. Paths are handled with `pathlib`, and the commands
-below work in PowerShell and in a POSIX shell alike.
-
----
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and tradeoffs.
 
 ## Setup
 
-**1. Configure.** The example file ships with working local defaults, so no
-editing is needed to run locally.
+Requires Python 3.11-3.13 and Docker Desktop with its Linux engine running.
+
+1. Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell).
+   The example contains working local development defaults.
+2. Start storage and wait for healthy containers:
+
+   ```bash
+   docker compose up -d --wait
+   ```
+
+3. Create and activate a virtual environment:
+
+   ```bash
+   python -m venv .venv
+   ```
+
+   PowerShell: `.venv\Scripts\Activate.ps1`
+
+   Linux/macOS: `source .venv/bin/activate`
+
+   Git Bash on Windows: `source .venv/Scripts/activate`
+
+4. Install the project and check storage:
+
+   ```bash
+   pip install -e ".[dev,orchestration]"
+   python scripts/check_infra.py
+   ```
+
+The MinIO console is at <http://localhost:9001>; credentials are in `.env`.
+MongoDB and MinIO use named volumes. `docker compose down` preserves data;
+adding `-v` deletes those volumes.
+
+## Run
+
+Ingest a date range, then transform the same inclusive publication-date range:
 
 ```bash
-cp .env.example .env
+python scripts/run_spider.py 2024-01-01 2024-03-31
+python scripts/run_transform.py 2024-01-01 2024-03-31
 ```
 
-PowerShell:
+Partial months work too. Records retain the start of their calendar period as
+`partition_date`, while transformation selects by `published_date`.
 
-```bash
-Copy-Item .env.example .env
-```
+The scraper supports `--bodies labour_court` (or comma-separated body names),
+`--size monthly`, `--output items.jsonl`, `--limit N`, and `--stats-json run.json`.
+The transform supports one `--bodies` value and `--stats-json`.
 
-**2. Start MongoDB and MinIO.**
+Ingestion reports every failed record and fails the command if coverage is
+incomplete or counts do not reconcile. Accounted-for record failures are
+allowed by the exercise and remain visible in the summary. Transformation
+exits nonzero if any selected record fails.
 
-```bash
-docker compose up -d
-```
-
-Both use **named volumes**, so data survives `docker compose down`. Wait for
-both to report healthy:
-
-```bash
-docker compose ps
-```
-
-The MinIO console is at <http://localhost:9001> (credentials from `.env`).
-
-**3. Create the Python environment.**
-
-```bash
-python -m venv .venv
-```
-
-Activate it — PowerShell:
-
-```bash
-.venv\Scripts\Activate.ps1
-```
-
-POSIX shell / Git Bash:
-
-```bash
-source .venv/Scripts/activate
-```
-
-Then install:
-
-```bash
-pip install -e ".[dev,orchestration]"
-```
-
-**4. Check the infrastructure.**
-
-```bash
-python scripts/check_infra.py
-```
-
-Round-trips a document through Mongo and a file through MinIO. Ends with
-`PASS - both stores round-tripped successfully.`
-
----
-
-## Running the pipeline
-
-### With the orchestrator
+### Dagster
 
 ```bash
 dagster dev
 ```
 
-Open <http://localhost:3000>. Two monthly-partitioned assets with a dependency
-edge between them:
-
-```
-landing_documents  ──>  curated_documents
-  (scrape + store)        (clean + rename)
-```
-
-Materialise a partition from the UI, or from the command line:
+Open <http://localhost:3000> and materialize `landing_documents` and
+`curated_documents`, or run:
 
 ```bash
 dagster job execute -j ingest_and_transform --partition 2024-02-01
 ```
 
-Set `DAGSTER_HOME` to an **absolute** path to keep run history between restarts.
+Both assets use `partitioning.size` from the same configuration profile.
+Supported calendar periods are daily, weekly (Monday start), monthly, quarterly,
+and yearly. `WRC_PARTITION_START` controls the earliest offered period and
+includes the full containing period if the supplied date is inside one.
+Reload the code location after changing the profile or partition settings.
+Set `DAGSTER_HOME` to an absolute path to retain run history.
 
-### From the command line
+## Storage and idempotency
 
-Ingest a date range — both dates inclusive, ISO format:
+A record's identity is its `detail_url`. Source identifiers are not unique:
+two decisions can share `RPD241`, so using the identifier as a database key
+would lose a record.
 
-```bash
-python scripts/run_spider.py 2024-01-01 2024-03-31
-```
+| Location | Contents | Update policy |
+|---|---|---|
+| Landing bucket | Original binary documents; whole HTML with configured volatile comments removed | New content gets a new object; existing objects are never replaced |
+| Landing collection | Metadata capture snapshots, including path and SHA-256 | Insert-only; identical snapshots are reused |
+| State collection | Latest capture pointer, metadata and first/last observation per detail URL | Updated by ingestion |
+| Curated bucket/collection | Clean documents and derived metadata with lineage | Rebuildable; updated when changed |
 
-Transform it into the curated layer:
+New landing object keys are
+`source/sha256(download_url)/file_hash/source_filename`.
+They distinguish changed content, query strings and different hosts. Writes
+use S3 conditional creation. If upload succeeds but metadata writing fails,
+a retry verifies the existing object's hash and completes the metadata write.
+A different or corrupted existing payload is reported, never overwritten.
 
-```bash
-python scripts/run_transform.py 2024-01-01 2024-03-31
-```
+Metadata snapshots have deterministic IDs based on the captured metadata and
+content hash, excluding run bookkeeping. The current-state collection is
+separate so updating `last_seen_at` does not mutate the capture. A document
+that changes from A to B and back to A reuses both snapshots and points to A.
+The state collection defaults to `<landing_collection>_state`; its name is
+configurable. `MetadataStore` landing lookup/range/count methods expose the
+current logical corpus. Direct Mongo queries of the landing collection expose
+capture history.
 
-Useful flags: `--bodies labour_court` restricts to one body (default: all four),
-`--output items.jsonl` also writes the scraped items, `--limit N` stops early
-for a smoke test, `--stats-json run.json` writes machine-readable counters.
+HTTP `ETag` or `Last-Modified` validators are used when available and tied to
+the exact downloaded URL. A 304 is accepted only with a stored object;
+otherwise the document is fetched without the validator. When the server
+provides no validator, HTML must be fetched to detect amendments. Such reruns
+avoid storage rewrites, but cannot promise zero network transfer. Persistent
+HTTP caching is optional for development and is disabled by default.
 
-Both commands exit non-zero if the run did not reconcile **or** did not search
-every partition it was asked to, so either can gate a CI step without anyone
-reading the logs.
+### Transformation
 
----
+PDF/DOC documents pass through byte-for-byte. BeautifulSoup selects the decision
+container from HTML and removes configured script/style tags and comments.
+Missing content fails explicitly; unusually short content produces a warning.
+The transform recomputes the hash and stores the resulting path and lineage.
 
-## Verifying it works
+Every curated file is named `identifier.ext` (with unsafe characters sanitized)
+inside a stable `sha256(detail_url)` directory. Duplicate identifiers therefore
+work across separate date ranges and in monthly Dagster jobs. Range processing
+streams records rather than collecting the whole corpus before starting.
 
-```bash
-python scripts/check_idempotency.py 2024-02-01 2024-02-29 --bodies labour_court
-```
+### Existing data
 
-Runs the ingestion twice and asserts thirteen things about the second run: that
-it stored nothing, that every stored file is still byte-identical (re-hashed
-*from storage*, not trusting the recorded hash), that `first_seen_at` was never
-rewritten, that `last_seen_at` **was** — which is what proves the second run
-genuinely revisited the records rather than crashing early — and that both runs
-searched the whole range, so two crawls that each did nothing cannot agree with
-each other and call it idempotency. Add `--fresh` if the range has already been
-ingested.
+No migration or deletion is required. Old URL-keyed landing records remain
+readable until revisited; ingestion creates snapshots and current-state entries
+without changing the old records. Unchanged files retain their old location.
+Changed files receive a new versioned location. Curated metadata moves to the
+new directory scheme on transformation; old curated objects are left intact.
+Anything pointing directly at old curated paths should use the current
+metadata's `file_key` after the next transform.
 
-The check itself has been validated against a deliberately broken build — a
-proof that only ever passes is not a proof.
-
-Other checks:
-
-| Command | Answers |
-|---|---|
-| `python scripts/check_storage.py` | Do the storage modules behave the way the pipeline assumes? |
-| `python scripts/show_config.py` | What settings is this run actually using? (secrets redacted) |
-| `python scripts/show_partitions.py 2024-01-01 2024-12-31` | How will this range be sliced, and what dates get sent to the site? |
-| `python scripts/tune_throughput.py 2024-02-01 2024-02-29 --bodies labour_court` | Re-runs the throughput sweep behind the settings in ARCHITECTURE.md. |
-
-### Tear down
-
-```bash
-docker compose down
-```
-
-Data is preserved in the named volumes. `docker compose down -v` deletes it too.
-
----
-
-## Tests
+## Verification
 
 ```bash
 pytest
+ruff check src tests scripts
 ```
 
-417 tests. The 34 needing containers are marked `integration` and **skip** rather
-than fail when Docker is not running, so a fresh clone is green either way:
+Offline tests use captured page fixtures and simulated storage failures.
+Integration tests use isolated collections and buckets in the real containers:
 
 ```bash
 pytest -m integration
 ```
 
-Everything else runs offline against page fixtures captured verbatim from the
-live site, so the suite does not depend on what the WRC published this morning.
+They skip locally if services are unavailable. Set `WRC_REQUIRE_INTEGRATION=1`
+to make unavailable services fail instead. CI starts the project's compose
+stack and requires integration tests on Python 3.11 and 3.13.
 
-### Linting
+Run a live idempotency check explicitly:
 
 ```bash
-ruff check src tests scripts
+python scripts/check_idempotency.py 2024-02-01 2024-02-29 --bodies labour_court --fresh
 ```
 
-The ruleset is in `pyproject.toml` and is chosen rather than inherited: the
-rules that catch mistakes are on (dead code, bugbear footguns, import order,
-blind excepts), and the pyupgrade dialect rules are off, because rewriting
-fourteen correct `timezone.utc` references to `UTC` is a large diff that changes
-no behaviour. Where a warning is suppressed, the `# noqa` carries the reason.
+`--fresh` creates isolated collections and buckets; it never deletes existing
+captures. Their names are printed and the test data is retained for inspection.
+The check performs two crawls, compares counts, rehashes stored objects, and
+checks observation timestamps and coverage. Omit `--fresh` for a range that
+has not been ingested. Running against an entirely unchanged existing range
+reports the first-run check as inconclusive.
 
-### CI
-
-`.github/workflows/ci.yml` runs the linter, then the **whole** suite —
-integration tests included — against the project's own `docker compose` stack,
-on the oldest and newest Python the package claims to support. Reusing the
-compose file rather than GitHub's `services:` block means CI exercises exactly
-the stack this README tells you to run.
-
----
+Other diagnostics: `scripts/show_config.py` (redacted configuration),
+`scripts/show_partitions.py`, `scripts/check_storage.py`, and
+`scripts/tune_throughput.py`.
 
 ## Configuration
 
-Two files, and nothing is hardcoded in the code:
+`.env` supplies credentials, connection endpoints and logging; it is ignored by
+Git. `config/settings.yaml` supplies body IDs, selectors, partition size,
+storage names and scraping settings. `WRC_CONFIG_FILE` selects another complete
+behavioral profile. Landing, current-state and curated collection names must
+be distinct; landing and curated buckets must also differ.
 
-| File | Holds | Committed? |
-|---|---|---|
-| `.env` | Connection strings, credentials, ports, log level | No (`.env.example` is) |
-| `config/settings.yaml` | Pipeline behaviour — partition size, buckets, collections, body IDs, selectors, Scrapy tuning | Yes |
+Logs are JSON on stdout, with optional `LOG_FILE`. Each run includes partition,
+body, record counts, failed URLs and reasons, plus a summary. HTTP failures
+include status codes. `crawl_complete` checks search coverage separately from
+`found = stored + unchanged + failed + duplicate_rows`.
 
-Every value has exactly one source, and the file it lives in tells you which.
-There is deliberately **no key-by-key environment override** of behavioural
-settings: to run a different profile, point `WRC_CONFIG_FILE` at a different
-YAML file and the whole profile swaps at once.
+## Measured throughput and source behavior
 
-Configuration problems are reported together, not one per run:
+The original development sweep on Labour Court February 2024 recorded:
 
-```
-Configuration is invalid (3 problems found).
-  - environment variable MONGO_URI is required but not set
-  - environment variable MINIO_ROOT_USER is required but not set
-  - LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL; got 'CHATTY'
-```
+| AutoThrottle target | Mean seconds | Requests/minute |
+|---|---:|---:|
+| 1 | 52.2 | 84 |
+| 2 (default) | 27.8 | 158 |
+| 4 | 27.9 | 157 |
+| 8 | 22.9 | 191 |
 
----
+These are historical measurements, not a benchmark of the latest changes.
+Target 2 balances throughput and load; `tune_throughput.py` reruns the sweep.
+Search redirects to error pages are retried. Detail redirects or missing
+content and HTML error responses in place of attachments are rejected before
+storage. Binary attachments are never passed through HTML normalization.
 
-## How it works
+`ROBOTSTXT_OBEY` remains on. Historical reconnaissance observed capitalized
+robots paths alongside lowercase live URLs; see [NOTES.md](NOTES.md) for the
+original investigation and operational caveats.
 
-```
-search results ──> detail page ──> attachment (only when there is one)
-                                          │
-        validate ──> dedup ──> store ──> write metadata
-```
+## Layout
 
-**The detail page decides the branch.** Every "View Page" link ends in `.html`
-regardless of what the record actually is, so the extension tells you nothing —
-the page has to be fetched and inspected. If it carries
-`div.related-items a.download` the decision is an attached PDF and the page is a
-stub; otherwise the decision text is inline and the page *is* the document.
-
-The four item-pipeline stages are one file each, so "where does deduplication
-happen?" has a one-word answer.
-
-**The transform** reads the landing metadata for a date range, passes PDFs
-through byte-for-byte, reduces HTML to the decision with BeautifulSoup, renames
-to `identifier.ext`, and writes to a separate bucket and collection. Nothing in
-the Landing Zone is ever written to — the curated record carries the lineage
-instead, so the raw capture stays exactly as scraped and the curated layer can be
-deleted and rebuilt.
-
-### Logging
-
-Line-delimited JSON on stdout. Set `LOG_FILE` to also write to a file.
-
-```json
-{"timestamp":"2026-09-04T18:29:38.342Z","level":"INFO","logger":"wrc_decisions",
- "message":"record stored","run_id":"20260904T182938Z-3e2785","partition_date":"2024-01-01",
- "body":"labour_court","identifier":"ADJ-00054658","event":"record.scraped","branch":"html"}
-```
-
-Every run ends with a `run.summary` event reconciling
-`found = stored + unchanged + failed + duplicate_rows`, with each failure
-itemised by URL and reason. Events use a fixed vocabulary
-(`logging_setup.Event`), so logs can be queried by `event` and the summary counts
-what the pipeline actually emitted.
-
-The summary also carries `crawl_complete`, which answers a question the
-reconciliation cannot. That equation is an identity, so it holds at
-`0 == 0`: a run that aborted before issuing a single request reports
-`reconciles: true` and looks like a month with no decisions in it — and since
-three of the four bodies genuinely are empty for most dates, nothing downstream
-could tell the difference. `crawl_complete` compares the `(partition, body)`
-units that produced a search page or a recorded failure against the number the
-run set out to search, so an aborted crawl is a failed one. A run stopped
-deliberately by `--limit` reports `crawl_truncated` instead and is not treated
-as a failure.
-
----
-
-## Four things the site does that shaped the code
-
-Each of these produces a pipeline that *looks* like it works, which is why they
-are worth stating.
-
-**Reference numbers are not unique.** `RPD241` is two different Labour Court
-decisions. Using it as the database key would silently destroy one — while the
-found-vs-scraped totals still reconciled, because both really were scraped.
-Records are keyed on `detail_url` instead; `identifier` stays indexed.
-
-**Every page carries per-request noise.** Responses embed the server's render
-time and cache state in HTML comments, so an unchanged page hashes differently
-on every fetch. Left unstripped, the pipeline re-downloads and re-writes the
-entire corpus on every run while reporting success.
-
-**Three of the four bodies are empty for most dates.** The Equality Tribunal and
-Employment Appeals Tribunal were folded into the WRC in 2015; the WRC has
-nothing before 2016. An empty search renders no result-count banner *and* no
-rows, so that combination means an empty partition — logged as normal, never as
-an error.
-
-**Under load the search endpoint redirects to an error page.** Observed live: a
-search that had returned 44 records answered `302` to `/ErrorPage.aspx`, and
-returned the same 44 records again two minutes later. Scrapy follows the
-redirect and the error page is a `200` with no banner and no rows — which is
-character-for-character what the rule above calls an empty partition. Left
-unhandled the run reports `found=0`, `reconciles: true`, `crawl_complete: true`
-and exits `0`, and a nightly run that hit a throttling window would record
-"no decisions this month" with every downstream check agreeing.
-
-Neither existing safeguard catches it: the reconciliation is an identity, so it
-holds at `0 == 0`, and `crawl_complete` asks whether a search page came back —
-one did. So the spider checks that the response is still *on* the search path
-before parsing it, retries the original URL if not, and records a failure once
-the retries are spent. The comparison ignores case and trailing slashes,
-because the site also serves `/en/Search` → `/en/search/` as a `301` and that
-one is not a problem — verified by pointing `search_path` at the redirecting
-form and confirming the crawl still returns its 44 records.
-
----
-
-## Throughput: what was measured
-
-ARCHITECTURE.md states the conclusion; this is the evidence behind it. Two
-sweeps with `scripts/tune_throughput.py`, one month of the Labour Court, varying
-AutoThrottle's target concurrency:
-
-| target concurrency | elapsed | req/min | non-200 | retries |
-|---|---|---|---|---|
-| 1 | 52.2s | 84 | 0 | 0 |
-| **2** ← chosen | **27.8s** | **158** | 0 | 0 |
-| 4 | 27.9s | 157 | 0 | 0 |
-| 8 | 22.9s | 191 | 0 | 0 |
-
-**2 and 4 are identical — that is the plateau**, and above it the ceiling is the
-server rather than the client. Target 8 buys about 20% more, and the site showed
-no distress at any level: zero non-200 responses across roughly 2,000 requests.
-
-Target 2 was chosen anyway. Across the evaluation corpus the difference between
-2 and 8 is about **one minute of wall clock**, which does not justify
-quadrupling the load placed on a small public service. The requirement asks for
-the fastest way to scrape *without getting blocked*; where the two readings of
-that diverge, this is a deliberate choice with the numbers written down rather
-than a guess, and re-running the sweep is one command.
-
-## robots.txt — a judgement call, stated openly
-
-`ROBOTSTXT_OBEY` is left **on**, and the crawl passes.
-
-It passes on a technicality. The site disallows `/Cases/` and `/en/Cases/` in
-*capitalised* form, while the live URLs are lowercase; RFC 9309 makes robots
-paths case-sensitive, so nothing is violated and no override was needed.
-
-That is worth saying out loud rather than leaving implicit in a green run. The
-directive's evident intent is to discourage bulk crawling of the case archive,
-even though `/en/search/` is not listed at all. In a real engagement this would
-be raised with the client before scraping at volume, rather than settled by
-reading the spec narrowly. It is recorded here so the decision is visible
-instead of accidental.
-
----
-
-## Repository layout
-
-```
-├── docker-compose.yml       Mongo + MinIO, named volumes
-├── .env.example             required variables, no secrets
-├── .github/workflows/ci.yml lint + the full suite against real containers
-├── config/settings.yaml     behavioural configuration
-├── src/wrc_pipeline/
-│   ├── config.py            settings.yaml + .env -> one validated object
-│   ├── logging_setup.py     JSON formatter, run_id, event vocabulary
-│   ├── partitions.py        date range -> units of work (pure logic)
-│   ├── scraper/
-│   │   ├── settings.py      Scrapy settings, read from config
-│   │   ├── items.py         the Landing Zone record schema
-│   │   ├── normalise.py     strips per-request noise before hashing/storing
-│   │   ├── runner.py        launches a crawl in its own process
-│   │   ├── spiders/         wrc_decisions.py
-│   │   └── pipelines/       validate -> dedup -> download -> mongo_writer
-│   ├── storage/
-│   │   ├── hashing.py       SHA-256, pure functions
-│   │   ├── object_store.py  S3 API (MinIO now, S3 later)
-│   │   ├── mongo.py         metadata upserts and range queries
-│   │   └── keys.py          object key naming policy
-│   ├── transform/
-│   │   ├── html_cleaner.py  select the decision, drop the furniture
-│   │   └── job.py           landing -> curated, idempotent
-│   └── orchestration/
-│       ├── resources.py     Mongo + object store as Dagster resources
-│       ├── assets.py        landing_documents -> curated_documents
-│       └── definitions.py   what `dagster dev` loads
-├── scripts/                 CLI entry points, health checks, idempotency proof
-└── tests/
-```
-
-`storage/` sits outside `scraper/` because both the spider and the transform job
-need Mongo and MinIO; nesting the clients inside the Scrapy package would force
-`transform` to import from `scraper` just to reach a database.
-
----
-
-## Further reading
-
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — partition size, retries and rate
-  limiting, deduplication, and scaling to 50+ sources. Deliberately one page;
-  the supporting evidence lives in this file instead, under **Throughput: what
-  was measured** and **robots.txt**.
-- **[NOTES.md](NOTES.md)** — reconnaissance and build notes: the full
-  requirements, what analysing the live site turned up (including several
-  corrections found by testing against it), the order the work was done in, and
-  the reasoning behind the decisions. Longer and rougher than the two documents
-  above, and kept because the site analysis is the part that would be most
-  tedious to reproduce.
+- `src/wrc_pipeline/scraper/`: spider, normalization, item pipelines and runner.
+- `src/wrc_pipeline/storage/`: metadata, object storage, hashes and naming.
+- `src/wrc_pipeline/transform/`: HTML extraction and date-range transformation.
+- `src/wrc_pipeline/orchestration/`: Dagster assets, resources and job.
+- `scripts/`: CLI entry points and diagnostics.
+- `tests/`: offline regressions, HTML fixtures and storage integration checks.

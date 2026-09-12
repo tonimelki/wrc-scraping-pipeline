@@ -13,6 +13,8 @@ something silently did not run.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from wrc_pipeline.config import ConfigError, Settings, load_settings
@@ -56,6 +58,8 @@ def live_settings() -> Settings:
     """Real settings, with the containers confirmed up. Skips otherwise."""
     available, reason = _services_available()
     if not available:
+        if os.environ.get("WRC_REQUIRE_INTEGRATION") == "1":
+            pytest.fail(f"integration storage is required but unavailable: {reason}")
         pytest.skip(
             f"storage containers are not available ({reason}). "
             f"Start them with: docker compose up -d"
